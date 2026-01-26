@@ -26,7 +26,7 @@ final class AmbientAudioEngine: ObservableObject {
         self.reverb = AVAudioUnitReverb()
         self.delay = AVAudioUnitDelay()
         self.filter = AVAudioUnitEQ(numberOfBands: 1)
-        self.volume = 1.0
+        self.volume = 0.5
         self.isPlaying = false
 
         // Audio session configuration is not applicable on macOS.
