@@ -16,8 +16,8 @@ final class AmbientAudioEngine: ObservableObject {
     private var timer: DispatchSourceTimer?
     @Published private(set) var isPlaying: Bool
 
-    private let audioFileName = "kys_angelic"
-    private let audioFileExtension = "aiff"
+    private let audioFileName = "atmosphere"
+    private let audioFileExtension = "wav"
 
     /// Initializes the ambient audio engine, configures the audio session and audio nodes.
     init() {
