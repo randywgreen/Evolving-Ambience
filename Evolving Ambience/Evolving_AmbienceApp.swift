@@ -12,6 +12,7 @@ struct Evolving_AmbienceApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .tint(.teal)
         }
     }
 }

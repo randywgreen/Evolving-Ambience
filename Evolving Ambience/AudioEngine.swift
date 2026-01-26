@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import Combine
 
 /// A class that manages an ambient audio engine playing a bundled audio file in a loop with evolving effects.
 final class AmbientAudioEngine: ObservableObject {
@@ -9,7 +10,9 @@ final class AmbientAudioEngine: ObservableObject {
     private let delay: AVAudioUnitDelay
     private let filter: AVAudioUnitEQ
 
-    @Published private(set) var volume: Float
+    @Published var volume: Float {
+        didSet { engine.mainMixerNode.outputVolume = max(0, min(volume, 1)) }
+    }
     private var timer: DispatchSourceTimer?
     @Published private(set) var isPlaying: Bool
 
@@ -26,19 +29,16 @@ final class AmbientAudioEngine: ObservableObject {
         self.volume = 1.0
         self.isPlaying = false
 
-        configureAudioSession()
+        // Audio session configuration is not applicable on macOS.
         configureNodes()
         attachAndConnectNodes()
     }
 
+    @available(iOS, unavailable)
+    @available(tvOS, unavailable)
+    @available(watchOS, unavailable)
     private func configureAudioSession() {
-        let session = AVAudioSession.sharedInstance()
-        do {
-            try session.setCategory(.playback, mode: .default, options: [])
-            try session.setActive(true, options: [])
-        } catch {
-            print("AmbientAudioEngine: Failed to configure audio session: \(error)")
-        }
+        // AVAudioSession is unavailable on macOS. No configuration needed for macOS playback.
     }
 
     private func configureNodes() {
@@ -101,6 +101,7 @@ final class AmbientAudioEngine: ObservableObject {
 
     /// Starts the ambient audio engine and begins playback with evolving effects.
     func start() {
+        // Ensure engine is running
         if !engine.isRunning {
             do {
                 try engine.start()
@@ -110,14 +111,19 @@ final class AmbientAudioEngine: ObservableObject {
             }
         }
 
-        if !player.isPlaying {
-            if player.outputFormat(forBus: 0).sampleRate == 0 {
-                loadAndScheduleLoop()
-            }
-            player.play()
-            isPlaying = true
-            startModulationTimer()
+        // Avoid re-starting if already playing
+        guard !player.isPlaying else {
+            print("AmbientAudioEngine: Player already playing.")
+            return
         }
+
+        // Always schedule at least once before the first play
+        loadAndScheduleLoop()
+        print("AmbientAudioEngine: Scheduled loop and starting playback.")
+
+        player.play()
+        isPlaying = true
+        startModulationTimer()
     }
 
     /// Stops the ambient audio playback and effect modulations.
@@ -194,3 +200,4 @@ final class AmbientAudioEngine: ObservableObject {
         timer?.resume()
     }
 }
+
