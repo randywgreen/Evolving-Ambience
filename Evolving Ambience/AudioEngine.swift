@@ -10,15 +10,15 @@ final class AmbientAudioEngine: ObservableObject {
     private let delay: AVAudioUnitDelay
     private let filter: AVAudioUnitEQ
 
-    // Chimes player and scheduling state
-    private let chimesPlayer = AVAudioPlayerNode()
-    private var chimesFile: AVAudioFile?
-    private var chimesTimer: DispatchSourceTimer?
-    private var chimesTargetVolume: Float = 0.6
-    private var chimesCurrentVolume: Float = 0.0
-    private var chimesState: ChimesState = .idle
+    // Texture player and scheduling state
+    private let texturePlayer = AVAudioPlayerNode()
+    private var textureFile: AVAudioFile?
+    private var textureTimer: DispatchSourceTimer?
+    private var textureTargetVolume: Float = 0.6
+    private var textureCurrentVolume: Float = 0.0
+    private var textureState: TextureState = .idle
 
-    private enum ChimesState { case idle, fadingIn, playing, fadingOut, cooldown }
+    private enum TextureState { case idle, fadingIn, playing, fadingOut, cooldown }
 
     // Synth bass pulse
     private var bassNode: AVAudioSourceNode?
@@ -175,7 +175,7 @@ final class AmbientAudioEngine: ObservableObject {
         engine.attach(delay)
         engine.attach(reverb)
         engine.attach(filter)
-        engine.attach(chimesPlayer)
+        engine.attach(texturePlayer)
 
         // Create and attach bass synth node
         let bass = makeBassNode(frequency: bassFrequency, bpm: bassBPM, gain: bassGain)
@@ -190,8 +190,8 @@ final class AmbientAudioEngine: ObservableObject {
         engine.connect(reverb, to: filter, format: nil)
         engine.connect(filter, to: mainMixer, format: nil)
 
-        // Chimes straight to mixer; dry by default
-        engine.connect(chimesPlayer, to: mainMixer, format: nil)
+        // Texture straight to mixer; dry by default
+        engine.connect(texturePlayer, to: mainMixer, format: nil)
 
         // Bass goes straight to main mixer (dry). You can route through effects if desired.
         engine.connect(bass, to: mainMixer, format: nil)
@@ -213,16 +213,16 @@ final class AmbientAudioEngine: ObservableObject {
         }
     }
 
-    private func loadChimesFile() {
-        guard chimesFile == nil else { return }
+    private func loadTextureFile() {
+        guard textureFile == nil else { return }
         guard let url = Bundle.main.url(forResource: "chimes", withExtension: "wav") else {
-            print("AmbientAudioEngine: chimes.wav not found in bundle.")
+            print("AmbientAudioEngine: texture file chimes.wav not found in bundle.")
             return
         }
         do {
-            chimesFile = try AVAudioFile(forReading: url)
+            textureFile = try AVAudioFile(forReading: url)
         } catch {
-            print("AmbientAudioEngine: Failed to load chimes.wav: \(error)")
+            print("AmbientAudioEngine: Failed to load texture (chimes.wav): \(error)")
         }
     }
 
@@ -233,12 +233,12 @@ final class AmbientAudioEngine: ObservableObject {
         })
     }
 
-    private func scheduleChimesIfNeeded() {
-        guard let file = chimesFile else { return }
+    private func scheduleTextureIfNeeded() {
+        guard let file = textureFile else { return }
         // If the player has no pending buffers, schedule once from start
-        if chimesPlayer.outputFormat(forBus: 0).channelCount > 0 { /* noop for format access */ }
-        chimesPlayer.stop()
-        chimesPlayer.scheduleFile(file, at: nil, completionHandler: nil)
+        if texturePlayer.outputFormat(forBus: 0).channelCount > 0 { /* noop for format access */ }
+        texturePlayer.stop()
+        texturePlayer.scheduleFile(file, at: nil, completionHandler: nil)
     }
 
     /// Starts the ambient audio engine and begins playback with evolving effects.
@@ -268,7 +268,7 @@ final class AmbientAudioEngine: ObservableObject {
         _ = bassNode // keep strong ref
         isPlaying = true
         startModulationTimer()
-        startChimesTimer()
+        startTextureTimer()
     }
 
     /// Stops the ambient audio playback and effect modulations.
@@ -279,12 +279,12 @@ final class AmbientAudioEngine: ObservableObject {
         timer?.cancel()
         timer = nil
 
-        chimesTimer?.cancel()
-        chimesTimer = nil
-        if chimesPlayer.isPlaying { chimesPlayer.stop() }
-        chimesState = .idle
-        chimesCurrentVolume = 0
-        chimesPlayer.volume = 0
+        textureTimer?.cancel()
+        textureTimer = nil
+        if texturePlayer.isPlaying { texturePlayer.stop() }
+        textureState = .idle
+        textureCurrentVolume = 0
+        texturePlayer.volume = 0
 
         isPlaying = false
 
@@ -418,11 +418,11 @@ final class AmbientAudioEngine: ObservableObject {
         timer?.resume()
     }
 
-    private func startChimesTimer() {
-        chimesTimer?.cancel()
+    private func startTextureTimer() {
+        textureTimer?.cancel()
         let queue = DispatchQueue.global(qos: .background)
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        chimesTimer = timer
+        textureTimer = timer
         timer.schedule(deadline: .now(), repeating: 0.25, leeway: .milliseconds(50))
         // Randomized control variables
         var nextActionTime = Date()
@@ -433,16 +433,16 @@ final class AmbientAudioEngine: ObservableObject {
             guard let self = self else { return }
             let now = Date()
 
-            switch self.chimesState {
+            switch self.textureState {
             case .idle:
                 // Randomly decide to start after a random delay (1-10s)
                 if now >= nextActionTime {
                     // 10% chance each tick to begin a fade-in sequence
                     if Double.random(in: 0...1) < 0.1 {
-                        self.loadChimesFile()
-                        self.scheduleChimesIfNeeded()
-                        if !self.chimesPlayer.isPlaying { self.chimesPlayer.play() }
-                        self.chimesState = .fadingIn
+                        self.loadTextureFile()
+                        self.scheduleTextureIfNeeded()
+                        if !self.texturePlayer.isPlaying { self.texturePlayer.play() }
+                        self.textureState = .fadingIn
                         fadeStartTime = now
                         fadeDuration = Double.random(in: 2.0...6.0)
                         nextActionTime = .distantFuture
@@ -454,17 +454,17 @@ final class AmbientAudioEngine: ObservableObject {
             case .fadingIn:
                 let t = now.timeIntervalSince(fadeStartTime)
                 let progress = min(1.0, max(0.0, t / max(0.1, fadeDuration)))
-                self.chimesCurrentVolume = Float(progress) * self.chimesTargetVolume
-                self.chimesPlayer.volume = self.chimesCurrentVolume
+                self.textureCurrentVolume = Float(progress) * self.textureTargetVolume
+                self.texturePlayer.volume = self.textureCurrentVolume
                 if progress >= 1.0 {
-                    self.chimesState = .playing
+                    self.textureState = .playing
                     // Decide random play time before fading out
                     nextActionTime = now.addingTimeInterval(Double.random(in: 5.0...20.0))
                 }
 
             case .playing:
                 if now >= nextActionTime {
-                    self.chimesState = .fadingOut
+                    self.textureState = .fadingOut
                     fadeStartTime = now
                     fadeDuration = Double.random(in: 2.0...6.0)
                 }
@@ -472,11 +472,11 @@ final class AmbientAudioEngine: ObservableObject {
             case .fadingOut:
                 let t = now.timeIntervalSince(fadeStartTime)
                 let progress = min(1.0, max(0.0, t / max(0.1, fadeDuration)))
-                self.chimesCurrentVolume = (1.0 - Float(progress)) * self.chimesTargetVolume
-                self.chimesPlayer.volume = self.chimesCurrentVolume
+                self.textureCurrentVolume = (1.0 - Float(progress)) * self.textureTargetVolume
+                self.texturePlayer.volume = self.textureCurrentVolume
                 if progress >= 1.0 {
-                    self.chimesPlayer.stop()
-                    self.chimesState = .cooldown
+                    self.texturePlayer.stop()
+                    self.textureState = .cooldown
                     // Ensure at least 20 seconds of silence
                     nextActionTime = now.addingTimeInterval(20.0 + Double.random(in: 0...20.0))
                 }
@@ -484,9 +484,9 @@ final class AmbientAudioEngine: ObservableObject {
             case .cooldown:
                 // Wait for cooldown to expire, then return to idle
                 if now >= nextActionTime {
-                    self.chimesState = .idle
-                    self.chimesCurrentVolume = 0
-                    self.chimesPlayer.volume = 0
+                    self.textureState = .idle
+                    self.textureCurrentVolume = 0
+                    self.texturePlayer.volume = 0
                 }
             }
         }
