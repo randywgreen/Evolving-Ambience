@@ -10,11 +10,19 @@ final class AmbientAudioEngine: ObservableObject {
     private let delay: AVAudioUnitDelay
     private let filter: AVAudioUnitEQ
 
+    // Submix mixers for per-node panning
+    private let atmosphereMixer = AVAudioMixerNode()
+    private let textureMixer = AVAudioMixerNode()
+
+    // Pan modulation state (-1.0 left to +1.0 right)
+    private var atmospherePanDrift: Double = 0
+    private var texturePanDrift: Double = 0
+
     // Texture player and scheduling state
     private let texturePlayer = AVAudioPlayerNode()
     private var textureFile: AVAudioFile?
     private var textureTimer: DispatchSourceTimer?
-    private var textureTargetVolume: Float = 0.6
+    private var textureTargetVolume: Float = 0.85
     private var textureCurrentVolume: Float = 0.0
     private var textureState: TextureState = .idle
 
@@ -225,6 +233,9 @@ final class AmbientAudioEngine: ObservableObject {
         engine.attach(filter)
         engine.attach(texturePlayer)
 
+        engine.attach(atmosphereMixer)
+        engine.attach(textureMixer)
+
         // Create and attach bass synth node
         let bass = makeBassNode(frequency: bassFrequency, bpm: bassBPM, gain: bassGain)
         self.bassNode = bass
@@ -232,14 +243,17 @@ final class AmbientAudioEngine: ObservableObject {
 
         let mainMixer = engine.mainMixerNode
 
-        // player -> delay -> reverb -> filter -> mainMixer
-        engine.connect(player, to: delay, format: nil)
+        // Atmosphere chain: player -> atmosphereMixer -> delay -> reverb -> filter -> mainMixer
+        engine.connect(player, to: atmosphereMixer, format: nil)
+        engine.connect(atmosphereMixer, to: delay, format: nil)
         engine.connect(delay, to: reverb, format: nil)
         engine.connect(reverb, to: filter, format: nil)
         engine.connect(filter, to: mainMixer, format: nil)
 
-        // Texture straight to mixer; dry by default
-        engine.connect(texturePlayer, to: mainMixer, format: nil)
+        // Texture chain via textureMixer
+        engine.connect(texturePlayer, to: textureMixer, format: nil)
+        engine.connect(textureMixer, to: mainMixer, format: nil)
+        textureMixer.outputVolume = 1.2
 
         // Bass goes straight to main mixer (dry). You can route through effects if desired.
         engine.connect(bass, to: mainMixer, format: nil)
@@ -287,6 +301,7 @@ final class AmbientAudioEngine: ObservableObject {
         if texturePlayer.outputFormat(forBus: 0).channelCount > 0 { /* noop for format access */ }
         texturePlayer.stop()
         texturePlayer.scheduleFile(file, at: nil, completionHandler: nil)
+        texturePlayer.volume = textureCurrentVolume
     }
 
     /// Starts the ambient audio engine and begins playback with evolving effects.
@@ -406,67 +421,102 @@ final class AmbientAudioEngine: ObservableObject {
 
         timer?.setEventHandler { [weak self] in
             guard let self = self else { return }
-            let elapsed = DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds
-            let elapsedSeconds = Double(elapsed) / 1_000_000_000
 
-            // Sine wave modulators with different periods and amplitudes
-            func sineWave(period: Double, amplitude: Double, offset: Double = 0) -> Double {
-                return amplitude * sin((2 * .pi / period) * elapsedSeconds + offset)
+            // Compute elapsed time in seconds with explicit typing
+            let nowDispatch: DispatchTime = DispatchTime.now()
+            let elapsedNanos: UInt64 = nowDispatch.uptimeNanoseconds - startTime.uptimeNanoseconds
+            let elapsedSeconds: Double = Double(elapsedNanos) / 1_000_000_000.0
+
+            // Local helpers with explicit types
+            @inline(__always)
+            func sineWave(period: Double, amplitude: Double, offset: Double = 0.0, t: Double) -> Double {
+                let omega: Double = (2.0 * Double.pi) / period
+                return amplitude * sin(omega * t + offset)
             }
+            @inline(__always)
+            func clamp(_ x: Double, _ lo: Double, _ hi: Double) -> Double { max(lo, min(hi, x)) }
 
-            // Base modulations (as before)
-            let reverbWetDryBase = 30.0
-            let reverbWetDryRange = 20.0
-            let reverbWetDryMix = reverbWetDryBase + sineWave(period: 60, amplitude: reverbWetDryRange)
+            // Base modulations
+            let reverbWetDryBase: Double = 30.0
+            let reverbWetDryRange: Double = 20.0
+            let reverbPrimary: Double = sineWave(period: 60.0, amplitude: reverbWetDryRange, t: elapsedSeconds)
+            let reverbWetDryMix: Double = reverbWetDryBase + reverbPrimary
 
-            let delayFeedbackBase = 20.0
-            let delayFeedbackRange = 15.0
-            let delayFeedback = delayFeedbackBase + sineWave(period: 120, amplitude: delayFeedbackRange, offset: .pi / 4)
+            let delayFeedbackBase: Double = 20.0
+            let delayFeedbackRange: Double = 15.0
+            let delayPrimary: Double = sineWave(period: 120.0, amplitude: delayFeedbackRange, offset: .pi / 4.0, t: elapsedSeconds)
+            let delayFeedback: Double = delayFeedbackBase + delayPrimary
 
-            let filterCutoffBase = 5000.0
-            let filterCutoffRange = 3500.0
-            let filterCutoff = filterCutoffBase + sineWave(period: 180, amplitude: filterCutoffRange, offset: .pi / 2)
+            let filterCutoffBase: Double = 5000.0
+            let filterCutoffRange: Double = 3500.0
+            let filterPrimary: Double = sineWave(period: 180.0, amplitude: filterCutoffRange, offset: .pi / 2.0, t: elapsedSeconds)
+            let filterCutoff: Double = filterCutoffBase + filterPrimary
 
-            let reverbWetDrySecondary = 5.0 * sin((2 * .pi / 90) * elapsedSeconds)
+            let reverbWetDrySecondary: Double = 5.0 * sin(((2.0 * Double.pi) / 90.0) * elapsedSeconds)
 
-            // Random-walk drifts for organic variation
-            randomWalk(&reverbDrift, step: 0.05, min: -10, max: 10)
-            randomWalk(&delayDrift, step: 0.03, min: -8, max: 8)
-            randomWalk(&filterDrift, step: 10, min: -800, max: 800)
+            // Pan random-walk drifts for organic stereo movement
+            self.randomWalk(&self.atmospherePanDrift, step: 0.005, min: -0.35, max: 0.35)
+            self.randomWalk(&self.texturePanDrift, step: 0.003, min: -0.15, max: 0.15)
 
             // Mood timing and target updates
-            if Date() >= moodChangeDeadline {
-                chooseNextMood()
+            let nowDate = Date()
+            if nowDate >= self.moodChangeDeadline {
+                self.chooseNextMood()
             }
 
             // Smoothly approach mood targets; small rate for slow easing
-            currentReverb = approach(currentReverb, targetReverb, rate: 0.02)
-            currentDelay  = approach(currentDelay,  targetDelay,  rate: 0.02)
-            currentCutoff = approach(currentCutoff, targetCutoff, rate: 0.02)
+            self.currentReverb = self.approach(self.currentReverb, self.targetReverb, rate: 0.02)
+            self.currentDelay  = self.approach(self.currentDelay,  self.targetDelay,  rate: 0.02)
+            self.currentCutoff = self.approach(self.currentCutoff, self.targetCutoff, rate: 0.02)
 
             // Occasional gesture trigger (low probability)
-            if !gestureActive && Double.random(in: 0...1) < 0.02 { // ~2% chance per tick
-                triggerReverbSwell()
+            if !self.gestureActive {
+                let r: Double = Double.random(in: 0.0...1.0)
+                if r < 0.02 { self.triggerReverbSwell() }
             }
-            if gestureActive && Date() >= gestureEndTime {
-                gestureActive = false
-                // Nudge target back toward current mood reverb center
-                if let m = currentMood {
-                    targetReverb = Double.random(in: m.reverbRange)
-                }
+            if self.gestureActive && nowDate >= self.gestureEndTime {
+                self.gestureActive = false
+                if let m = self.currentMood { self.targetReverb = Double.random(in: m.reverbRange) }
             }
 
-            // Compose final values: base LFOs + secondary + drift + mood-eased centers
-            let finalReverb = max(0, min(100, (reverbWetDryMix + reverbWetDrySecondary + reverbDrift + currentReverb) / 2))
-            let finalDelay  = max(0, min(100, (delayFeedback + delayDrift + currentDelay) / 2))
-            let finalCutoff = max(100, min(22000, (filterCutoff + filterDrift + currentCutoff) / 2))
+            // Slow pan LFOs (atmosphere roams more)
+            let atmospherePanLFO: Double = 0.5 * sin(((2.0 * Double.pi) / 150.0) * elapsedSeconds)
+            let texturePanLFO: Double = 0.2 * sin(((2.0 * Double.pi) / 120.0) * elapsedSeconds + (.pi / 3.0))
+
+            // Combine and clamp pan values for submixes
+            let atmosphereCombined: Double = atmospherePanLFO + self.atmospherePanDrift
+            let textureCombined: Double = texturePanLFO + self.texturePanDrift
+            let finalAtmospherePanD: Double = clamp(atmosphereCombined, -1.0, 1.0)
+            let finalTexturePanD: Double = clamp(textureCombined, -1.0, 1.0)
+            let finalAtmospherePanF: Float = Float(finalAtmospherePanD)
+            let finalTexturePanF: Float = Float(finalTexturePanD)
+
+            // Compose final values with explicit steps
+            let reverbSum: Double = reverbWetDryMix + reverbWetDrySecondary + self.reverbDrift + self.currentReverb
+            let delaySum: Double  = delayFeedback + self.delayDrift + self.currentDelay
+            let cutoffSum: Double = filterCutoff + self.filterDrift + self.currentCutoff
+
+            let reverbAveraged: Double = reverbSum / 2.0
+            let delayAveraged: Double  = delaySum / 2.0
+            let cutoffAveraged: Double = cutoffSum / 2.0
+
+            let finalReverbD: Double = clamp(reverbAveraged, 0.0, 100.0)
+            let finalDelayD: Double  = clamp(delayAveraged, 0.0, 100.0)
+            let finalCutoffD: Double = clamp(cutoffAveraged, 100.0, 22_000.0)
+
+            let finalReverbF: Float = Float(finalReverbD)
+            let finalDelayF: Float  = Float(finalDelayD)
+            let finalCutoffF: Float = Float(finalCutoffD)
 
             DispatchQueue.main.async {
-                self.reverb.wetDryMix = Float(finalReverb)
-                self.delay.feedback = Float(finalDelay)
+                self.reverb.wetDryMix = finalReverbF
+                self.delay.feedback = finalDelayF
                 if let band = self.filter.bands.first {
-                    band.frequency = Float(finalCutoff)
+                    band.frequency = finalCutoffF
                 }
+                // Per-node pan via AVAudioMixerNode submixes
+                self.atmosphereMixer.pan = finalAtmospherePanF
+                self.textureMixer.pan = finalTexturePanF
             }
         }
         timer?.resume()
@@ -498,7 +548,7 @@ final class AmbientAudioEngine: ObservableObject {
                         if !self.texturePlayer.isPlaying { self.texturePlayer.play() }
                         self.textureState = .fadingIn
                         fadeStartTime = now
-                        fadeDuration = Double.random(in: 2.0...6.0)
+                        fadeDuration = Double.random(in: 1.0...3.0)
                         nextActionTime = .distantFuture
                     } else {
                         nextActionTime = now.addingTimeInterval(Double.random(in: 1...10))
@@ -513,14 +563,14 @@ final class AmbientAudioEngine: ObservableObject {
                 if progress >= 1.0 {
                     self.textureState = .playing
                     // Decide random play time before fading out
-                    nextActionTime = now.addingTimeInterval(Double.random(in: 5.0...20.0))
+                    nextActionTime = now.addingTimeInterval(Double.random(in: 12.0...28.0))
                 }
 
             case .playing:
                 if now >= nextActionTime {
                     self.textureState = .fadingOut
                     fadeStartTime = now
-                    fadeDuration = Double.random(in: 2.0...6.0)
+                    fadeDuration = Double.random(in: 3.0...7.0)
                 }
 
             case .fadingOut:
