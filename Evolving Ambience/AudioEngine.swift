@@ -22,7 +22,13 @@ final class AmbientAudioEngine: ObservableObject {
 
     // Synth bass pulse
     private var bassNode: AVAudioSourceNode?
-    private var bassFrequency: Double = 55 // Hz
+    private var bassFrequency: Double = 55 { // Hz
+        didSet {
+            if oldValue != bassFrequency {
+                print("AmbientAudioEngine: bassFrequency changed to \(String(format: "%.2f", bassFrequency)) Hz")
+            }
+        }
+    }
     private var bassBPM: Double = 60 // beats per minute
     private var bassGain: Double = 0.35 // linear gain 0..1
 
@@ -33,13 +39,53 @@ final class AmbientAudioEngine: ObservableObject {
         let delayRange: ClosedRange<Double>
         let cutoffRange: ClosedRange<Double>
         let duration: ClosedRange<TimeInterval>
+        // Bass parameters per mood
+        let bassFrequencyRange: ClosedRange<Double>
+        let bassGainRange: ClosedRange<Double>
+        let bassBPMRange: ClosedRange<Double>
     }
 
     private let moods: [Mood] = [
-        Mood(name: "Calm",    reverbRange: 20...40, delayRange: 10...25, cutoffRange: 4000...7000, duration: 45...90),
-        Mood(name: "Misty",   reverbRange: 35...55, delayRange: 15...30, cutoffRange: 2500...5500, duration: 60...120),
-        Mood(name: "Dense",   reverbRange: 50...70, delayRange: 25...45, cutoffRange: 1500...4000, duration: 45...75),
-        Mood(name: "Sparkly", reverbRange: 25...45, delayRange: 10...30, cutoffRange: 6000...12000, duration: 30...60)
+        Mood(
+            name: "Calm",
+            reverbRange: 20...40,
+            delayRange: 10...25,
+            cutoffRange: 4000...7000,
+            duration: 45...90,
+            bassFrequencyRange: 40...52,   // deeper
+            bassGainRange: 0.20...0.35,    // softer
+            bassBPMRange: 50...60          // slower to moderate
+        ),
+        Mood(
+            name: "Misty",
+            reverbRange: 35...55,
+            delayRange: 15...30,
+            cutoffRange: 2500...5500,
+            duration: 60...120,
+            bassFrequencyRange: 45...58,
+            bassGainRange: 0.22...0.38,
+            bassBPMRange: 55...65
+        ),
+        Mood(
+            name: "Dense",
+            reverbRange: 50...70,
+            delayRange: 25...45,
+            cutoffRange: 1500...4000,
+            duration: 45...75,
+            bassFrequencyRange: 50...65,   // a bit higher to cut through
+            bassGainRange: 0.30...0.45,    // slightly louder
+            bassBPMRange: 60...75          // faster
+        ),
+        Mood(
+            name: "Sparkly",
+            reverbRange: 25...45,
+            delayRange: 10...30,
+            cutoffRange: 6000...12000,
+            duration: 30...60,
+            bassFrequencyRange: 48...60,
+            bassGainRange: 0.22...0.38,
+            bassBPMRange: 58...70
+        )
     ]
 
     private var currentMood: Mood?
@@ -325,6 +371,12 @@ final class AmbientAudioEngine: ObservableObject {
         targetReverb = Double.random(in: m.reverbRange)
         targetDelay = Double.random(in: m.delayRange)
         targetCutoff = Double.random(in: m.cutoffRange)
+
+        // Update bass parameters per mood
+        bassFrequency = Double.random(in: m.bassFrequencyRange)
+        print("AmbientAudioEngine: mood \(m.name) set bassFrequency to \(String(format: "%.2f", bassFrequency)) Hz")
+        bassGain = Double.random(in: m.bassGainRange)
+        bassBPM = Double.random(in: m.bassBPMRange)
     }
 
     private func approach(_ current: Double, _ target: Double, rate: Double) -> Double {
