@@ -69,8 +69,10 @@ final class AmbientAudioEngine: ObservableObject {
     private var timer: DispatchSourceTimer?
     @Published private(set) var isPlaying: Bool
 
-    private let audioFileName = "atmosphere"
-    private let audioFileExtension = "wav"
+    var atmosphereFileName = "atmosphere"
+    var atmosphereFileExtension = "wav"
+    var textureFileName = "chimes"
+    var textureFileExtension = "wav"
 
     /// Initializes the ambient audio engine, configures the audio session and audio nodes.
     init() {
@@ -200,8 +202,8 @@ final class AmbientAudioEngine: ObservableObject {
     }
 
     private func loadAndScheduleLoop() {
-        guard let url = Bundle.main.url(forResource: audioFileName, withExtension: audioFileExtension) else {
-            print("AmbientAudioEngine: Audio file \(audioFileName).\(audioFileExtension) not found in bundle.")
+        guard let url = Bundle.main.url(forResource: atmosphereFileName, withExtension: atmosphereFileExtension) else {
+            print("AmbientAudioEngine: Audio file \(atmosphereFileName).\(atmosphereFileExtension) not found in bundle.")
             return
         }
 
@@ -215,14 +217,14 @@ final class AmbientAudioEngine: ObservableObject {
 
     private func loadTextureFile() {
         guard textureFile == nil else { return }
-        guard let url = Bundle.main.url(forResource: "chimes", withExtension: "wav") else {
-            print("AmbientAudioEngine: texture file chimes.wav not found in bundle.")
+        guard let url = Bundle.main.url(forResource: textureFileName, withExtension: textureFileExtension) else {
+            print("AmbientAudioEngine: texture file \(textureFileName).\(textureFileExtension) not found in bundle.")
             return
         }
         do {
             textureFile = try AVAudioFile(forReading: url)
         } catch {
-            print("AmbientAudioEngine: Failed to load texture (chimes.wav): \(error)")
+            print("AmbientAudioEngine: Failed to load texture (\(textureFileName).\(textureFileExtension)): \(error)")
         }
     }
 
