@@ -1,2 +1,6 @@
 .DS_Store 
-"Evolving Ambience.xcodeproj"/
+Evolving\ Ambience.xcodeproj/
+DerivedData/
+*.xcuserdata/
+*.xcuserstate
+.build/

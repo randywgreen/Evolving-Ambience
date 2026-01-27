@@ -194,6 +194,8 @@ final class AmbientAudioEngine: ObservableObject {
 
     private func chooseNextMood() {
         currentMood = moods.randomElement()
+        let moodName = currentMood?.name ?? "nil"
+        print("currentMood: \(moodName)")
         guard let m = currentMood else { return }
         let dur = TimeInterval.random(in: m.duration)
         moodChangeDeadline = Date().addingTimeInterval(dur)
