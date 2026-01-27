@@ -10,6 +10,12 @@ final class AmbientAudioEngine: ObservableObject {
     private let delay: AVAudioUnitDelay
     private let filter: AVAudioUnitEQ
 
+    // Synth bass pulse
+    private var bassNode: AVAudioSourceNode?
+    private var bassFrequency: Double = 55 // Hz
+    private var bassBPM: Double = 60 // beats per minute
+    private var bassGain: Double = 0.35 // linear gain 0..1
+
     // Generative state
     private struct Mood {
         let name: String
@@ -99,11 +105,71 @@ final class AmbientAudioEngine: ObservableObject {
         }
     }
 
+    private func makeBassNode(frequency: Double, bpm: Double, gain: Double) -> AVAudioSourceNode {
+        var phase: Double = 0
+        var time: Double = 0
+        var cachedSampleRate: Double = 0
+        let twoPi = 2.0 * Double.pi
+        let beatPeriod = 60.0 / max(1.0, bpm)
+        let attack: Double = 0.01
+        let decay: Double = 0.22
+
+        let node = AVAudioSourceNode { _, refTime, frameCount, audioBufferList -> OSStatus in
+            let abl = UnsafeMutableAudioBufferListPointer(audioBufferList)
+            let frames = Int(frameCount)
+
+            // Determine sample rate from the output format only once
+            if cachedSampleRate == 0, let format = abl.first?.mData?.assumingMemoryBound(to: Float.self) {
+                // Fallback to common sample rates if format is not informative; AVAudioEngine will set real rate
+                cachedSampleRate = 44100
+                _ = format // silence unused warning
+            }
+            if cachedSampleRate == 0 {
+                cachedSampleRate = 44100
+            }
+
+            for frame in 0..<frames {
+                // Sine oscillator
+                let sample = sin(phase)
+
+                // Simple per-beat envelope (attack/decay, then silence until next beat)
+                let tInBeat = time.truncatingRemainder(dividingBy: beatPeriod)
+                let env: Double
+                if tInBeat < attack {
+                    env = tInBeat / attack
+                } else if tInBeat < attack + decay {
+                    let d = (tInBeat - attack) / decay
+                    env = max(0.0, 1.0 - d)
+                } else {
+                    env = 0.0
+                }
+
+                let out = Float(sample * env * gain)
+
+                phase += twoPi * frequency / cachedSampleRate
+                if phase >= twoPi { phase -= twoPi }
+                time += 1.0 / cachedSampleRate
+
+                for buffer in abl {
+                    let ptr = buffer.mData!.assumingMemoryBound(to: Float.self)
+                    ptr[frame] = out
+                }
+            }
+            return noErr
+        }
+        return node
+    }
+
     private func attachAndConnectNodes() {
         engine.attach(player)
         engine.attach(delay)
         engine.attach(reverb)
         engine.attach(filter)
+
+        // Create and attach bass synth node
+        let bass = makeBassNode(frequency: bassFrequency, bpm: bassBPM, gain: bassGain)
+        self.bassNode = bass
+        engine.attach(bass)
 
         let mainMixer = engine.mainMixerNode
 
@@ -112,6 +178,9 @@ final class AmbientAudioEngine: ObservableObject {
         engine.connect(delay, to: reverb, format: nil)
         engine.connect(reverb, to: filter, format: nil)
         engine.connect(filter, to: mainMixer, format: nil)
+
+        // Bass goes straight to main mixer (dry). You can route through effects if desired.
+        engine.connect(bass, to: mainMixer, format: nil)
 
         mainMixer.outputVolume = volume
     }
@@ -160,6 +229,8 @@ final class AmbientAudioEngine: ObservableObject {
         print("AmbientAudioEngine: Scheduled loop and starting playback.")
 
         player.play()
+        // Bass source node runs as part of the engine graph; nothing to schedule.
+        _ = bassNode // keep strong ref
         isPlaying = true
         startModulationTimer()
     }
@@ -172,6 +243,12 @@ final class AmbientAudioEngine: ObservableObject {
         timer?.cancel()
         timer = nil
         isPlaying = false
+
+        // Recreate bass node next time to reset its phase/time
+        if let bass = bassNode {
+            engine.detach(bass)
+            bassNode = nil
+        }
     }
 
     /// Sets the output volume of the audio engine.
