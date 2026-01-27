@@ -10,6 +10,16 @@ final class AmbientAudioEngine: ObservableObject {
     private let delay: AVAudioUnitDelay
     private let filter: AVAudioUnitEQ
 
+    // Chimes player and scheduling state
+    private let chimesPlayer = AVAudioPlayerNode()
+    private var chimesFile: AVAudioFile?
+    private var chimesTimer: DispatchSourceTimer?
+    private var chimesTargetVolume: Float = 0.6
+    private var chimesCurrentVolume: Float = 0.0
+    private var chimesState: ChimesState = .idle
+
+    private enum ChimesState { case idle, fadingIn, playing, fadingOut, cooldown }
+
     // Synth bass pulse
     private var bassNode: AVAudioSourceNode?
     private var bassFrequency: Double = 55 // Hz
@@ -165,6 +175,7 @@ final class AmbientAudioEngine: ObservableObject {
         engine.attach(delay)
         engine.attach(reverb)
         engine.attach(filter)
+        engine.attach(chimesPlayer)
 
         // Create and attach bass synth node
         let bass = makeBassNode(frequency: bassFrequency, bpm: bassBPM, gain: bassGain)
@@ -178,6 +189,9 @@ final class AmbientAudioEngine: ObservableObject {
         engine.connect(delay, to: reverb, format: nil)
         engine.connect(reverb, to: filter, format: nil)
         engine.connect(filter, to: mainMixer, format: nil)
+
+        // Chimes straight to mixer; dry by default
+        engine.connect(chimesPlayer, to: mainMixer, format: nil)
 
         // Bass goes straight to main mixer (dry). You can route through effects if desired.
         engine.connect(bass, to: mainMixer, format: nil)
@@ -199,11 +213,32 @@ final class AmbientAudioEngine: ObservableObject {
         }
     }
 
+    private func loadChimesFile() {
+        guard chimesFile == nil else { return }
+        guard let url = Bundle.main.url(forResource: "chimes", withExtension: "wav") else {
+            print("AmbientAudioEngine: chimes.wav not found in bundle.")
+            return
+        }
+        do {
+            chimesFile = try AVAudioFile(forReading: url)
+        } catch {
+            print("AmbientAudioEngine: Failed to load chimes.wav: \(error)")
+        }
+    }
+
     private func scheduleLoop(audioFile: AVAudioFile) {
         player.scheduleFile(audioFile, at: nil, completionHandler: { [weak self] in
             guard let self = self else { return }
             self.scheduleLoop(audioFile: audioFile)
         })
+    }
+
+    private func scheduleChimesIfNeeded() {
+        guard let file = chimesFile else { return }
+        // If the player has no pending buffers, schedule once from start
+        if chimesPlayer.outputFormat(forBus: 0).channelCount > 0 { /* noop for format access */ }
+        chimesPlayer.stop()
+        chimesPlayer.scheduleFile(file, at: nil, completionHandler: nil)
     }
 
     /// Starts the ambient audio engine and begins playback with evolving effects.
@@ -233,6 +268,7 @@ final class AmbientAudioEngine: ObservableObject {
         _ = bassNode // keep strong ref
         isPlaying = true
         startModulationTimer()
+        startChimesTimer()
     }
 
     /// Stops the ambient audio playback and effect modulations.
@@ -242,6 +278,14 @@ final class AmbientAudioEngine: ObservableObject {
         }
         timer?.cancel()
         timer = nil
+
+        chimesTimer?.cancel()
+        chimesTimer = nil
+        if chimesPlayer.isPlaying { chimesPlayer.stop() }
+        chimesState = .idle
+        chimesCurrentVolume = 0
+        chimesPlayer.volume = 0
+
         isPlaying = false
 
         // Recreate bass node next time to reset its phase/time
@@ -372,6 +416,81 @@ final class AmbientAudioEngine: ObservableObject {
             }
         }
         timer?.resume()
+    }
+
+    private func startChimesTimer() {
+        chimesTimer?.cancel()
+        let queue = DispatchQueue.global(qos: .background)
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        chimesTimer = timer
+        timer.schedule(deadline: .now(), repeating: 0.25, leeway: .milliseconds(50))
+        // Randomized control variables
+        var nextActionTime = Date()
+        var fadeStartTime = Date()
+        var fadeDuration: TimeInterval = 0
+
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            let now = Date()
+
+            switch self.chimesState {
+            case .idle:
+                // Randomly decide to start after a random delay (1-10s)
+                if now >= nextActionTime {
+                    // 10% chance each tick to begin a fade-in sequence
+                    if Double.random(in: 0...1) < 0.1 {
+                        self.loadChimesFile()
+                        self.scheduleChimesIfNeeded()
+                        if !self.chimesPlayer.isPlaying { self.chimesPlayer.play() }
+                        self.chimesState = .fadingIn
+                        fadeStartTime = now
+                        fadeDuration = Double.random(in: 2.0...6.0)
+                        nextActionTime = .distantFuture
+                    } else {
+                        nextActionTime = now.addingTimeInterval(Double.random(in: 1...10))
+                    }
+                }
+
+            case .fadingIn:
+                let t = now.timeIntervalSince(fadeStartTime)
+                let progress = min(1.0, max(0.0, t / max(0.1, fadeDuration)))
+                self.chimesCurrentVolume = Float(progress) * self.chimesTargetVolume
+                self.chimesPlayer.volume = self.chimesCurrentVolume
+                if progress >= 1.0 {
+                    self.chimesState = .playing
+                    // Decide random play time before fading out
+                    nextActionTime = now.addingTimeInterval(Double.random(in: 5.0...20.0))
+                }
+
+            case .playing:
+                if now >= nextActionTime {
+                    self.chimesState = .fadingOut
+                    fadeStartTime = now
+                    fadeDuration = Double.random(in: 2.0...6.0)
+                }
+
+            case .fadingOut:
+                let t = now.timeIntervalSince(fadeStartTime)
+                let progress = min(1.0, max(0.0, t / max(0.1, fadeDuration)))
+                self.chimesCurrentVolume = (1.0 - Float(progress)) * self.chimesTargetVolume
+                self.chimesPlayer.volume = self.chimesCurrentVolume
+                if progress >= 1.0 {
+                    self.chimesPlayer.stop()
+                    self.chimesState = .cooldown
+                    // Ensure at least 20 seconds of silence
+                    nextActionTime = now.addingTimeInterval(20.0 + Double.random(in: 0...20.0))
+                }
+
+            case .cooldown:
+                // Wait for cooldown to expire, then return to idle
+                if now >= nextActionTime {
+                    self.chimesState = .idle
+                    self.chimesCurrentVolume = 0
+                    self.chimesPlayer.volume = 0
+                }
+            }
+        }
+        timer.resume()
     }
 }
 
