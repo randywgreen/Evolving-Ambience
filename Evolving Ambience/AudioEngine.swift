@@ -666,7 +666,7 @@ final class AmbientAudioEngine: ObservableObject {
                 let p: Double = max(0.0, min(1.0, t / denom))
                 // ease-in-out for smoother swell
                 let eased: Double = 0.5 - 0.5 * cos(p * Double.pi)
-                swellWet = 0.08 * eased // up to +8% wet
+                swellWet = 0.02 * eased // up to +8% wet
                 swellPreDelay = 0.020 + 0.025 * eased // add ~20-45 ms pre-delay
                 if t >= strongSelf.swellDuration {
                     strongSelf.swellState = .cooling
