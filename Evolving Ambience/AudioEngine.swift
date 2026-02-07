@@ -2,8 +2,28 @@ import Foundation
 import AVFoundation
 import Combine
 
+/// Protocol for loading audio files, allowing dependency injection for testing or alternative implementations.
+public protocol AudioFileLoader {
+    func loadAudioFile(named name: String, extension ext: String) -> AVAudioFile?
+}
+
+/// Default implementation of AudioFileLoader that loads files from the main bundle.
+public struct DefaultAudioFileLoader: AudioFileLoader {
+    public init() { }
+    public func loadAudioFile(named name: String, extension ext: String) -> AVAudioFile? {
+        guard let url = Bundle.main.url(forResource: name, withExtension: ext) else {
+            return nil
+        }
+        return try? AVAudioFile(forReading: url)
+    }
+}
+
 /// A class that manages an ambient audio engine playing a bundled audio file in a loop with evolving effects.
-final class AmbientAudioEngine: ObservableObject {
+/// 
+/// This class is marked with @MainActor to ensure all properties and methods are main actor isolated,
+/// providing thread safety and consistent state management without explicit synchronization.
+@MainActor
+public final class AmbientAudioEngine: ObservableObject {
     private let engine: AVAudioEngine
     private let player: AVAudioPlayerNode
     private let reverb: AVAudioUnitReverb
@@ -13,7 +33,7 @@ final class AmbientAudioEngine: ObservableObject {
     // Colored noise bed (air)
     private var noiseNode: AVAudioSourceNode?
     private let noiseLowpass = AVAudioUnitEQ(numberOfBands: 1)
-    @Published var noiseEnabled: Bool = true
+    @Published public var noiseEnabled: Bool = true
     private var noiseGain: Float = 0.05 // very low level
     private var noiseCutoffBase: Double = 8000 // Hz
     private var noiseCutoffRange: Double = 3000 // +/- range for modulation
@@ -29,81 +49,84 @@ final class AmbientAudioEngine: ObservableObject {
     // Texture player and scheduling state
     private let texturePlayer = AVAudioPlayerNode()
     private var textureFile: AVAudioFile?
-    private var textureTargetVolume: Float = 0.55
-    private var textureCurrentVolume: Float = 0.0
-    private var textureState: TextureState = .idle
+    private let textureTargetVolume: Float = 0.55
 
-    private enum TextureState { case idle, fadingIn, playing, fadingOut, cooldown }
+    /// Published texture current volume for UI observation of fades
+    @Published public var textureCurrentVolume: Float = 0.0
+
+    /// Texture playback state published for UI observation
+    @Published public var textureState: TextureState = .idle
+
+    public enum TextureState { case idle, fadingIn, playing, fadingOut, cooldown }
 
     // Synth bass pulse
     private var bassNode: AVAudioSourceNode?
-    private var bassFrequency: Double = 55 { // Hz
+    /// Bass frequency in Hz. Setting updates the oscillator immediately.
+    public var bassFrequency: Double = 55 { // Hz
         didSet {
             if oldValue != bassFrequency {
                 print("AmbientAudioEngine: bassFrequency changed to \(String(format: "%.2f", bassFrequency)) Hz")
+                updateBassNode()
             }
         }
     }
-    private var bassBPM: Double = 60 // beats per minute
-    private var bassGain: Double = 0.35 // linear gain 0..1
-
-    // Generative state
-    private struct Mood {
-        let name: String
-        let reverbRange: ClosedRange<Double>
-        let delayRange: ClosedRange<Double>
-        let cutoffRange: ClosedRange<Double>
-        let duration: ClosedRange<TimeInterval>
-        // Bass parameters per mood
-        let bassFrequencyRange: ClosedRange<Double>
-        let bassGainRange: ClosedRange<Double>
-        let bassBPMRange: ClosedRange<Double>
+    /// Bass beats per minute. Setting updates the oscillator immediately.
+    public var bassBPM: Double = 60 { // beats per minute
+        didSet {
+            if oldValue != bassBPM {
+                print("AmbientAudioEngine: bassBPM changed to \(String(format: "%.2f", bassBPM)) bpm")
+                updateBassNode()
+            }
+        }
+    }
+    /// Bass gain (linear 0..1). Setting updates oscillator gain immediately.
+    public var bassGain: Double = 0.35 { // linear gain 0..1
+        didSet {
+            if oldValue != bassGain {
+                print("AmbientAudioEngine: bassGain changed to \(String(format: "%.3f", bassGain))")
+                updateBassNode()
+            }
+        }
     }
 
-    private let moods: [Mood] = [
-        Mood(
-            name: "Calm",
-            reverbRange: 20...40,
-            delayRange: 10...25,
-            cutoffRange: 4000...7000,
-            duration: 45...90,
-            bassFrequencyRange: 40...52,   // deeper
-            bassGainRange: 0.20...0.35,    // softer
-            bassBPMRange: 50...60          // slower to moderate
-        ),
-        Mood(
-            name: "Misty",
-            reverbRange: 35...55,
-            delayRange: 15...30,
-            cutoffRange: 2500...5500,
-            duration: 60...120,
-            bassFrequencyRange: 45...58,
-            bassGainRange: 0.22...0.38,
-            bassBPMRange: 55...65
-        ),
-        Mood(
-            name: "Dense",
-            reverbRange: 50...70,
-            delayRange: 25...45,
-            cutoffRange: 1500...4000,
-            duration: 45...75,
-            bassFrequencyRange: 50...65,   // a bit higher to cut through
-            bassGainRange: 0.30...0.45,    // slightly louder
-            bassBPMRange: 60...75          // faster
-        ),
-        Mood(
-            name: "Sparkly",
-            reverbRange: 25...45,
-            delayRange: 10...30,
-            cutoffRange: 6000...12000,
-            duration: 30...60,
-            bassFrequencyRange: 48...60,
-            bassGainRange: 0.22...0.38,
-            bassBPMRange: 58...70
-        )
-    ]
+    // Generative state
+    
+    /// Public struct representing a mood configuration, equatable to allow external modification and removal.
+    public struct Mood: Equatable {
+        public let name: String
+        public let reverbRange: ClosedRange<Double>
+        public let delayRange: ClosedRange<Double>
+        public let cutoffRange: ClosedRange<Double>
+        public let duration: ClosedRange<TimeInterval>
+        // Bass parameters per mood
+        public let bassFrequencyRange: ClosedRange<Double>
+        public let bassGainRange: ClosedRange<Double>
+        public let bassBPMRange: ClosedRange<Double>
+        public init(name: String,
+                    reverbRange: ClosedRange<Double>,
+                    delayRange: ClosedRange<Double>,
+                    cutoffRange: ClosedRange<Double>,
+                    duration: ClosedRange<TimeInterval>,
+                    bassFrequencyRange: ClosedRange<Double>,
+                    bassGainRange: ClosedRange<Double>,
+                    bassBPMRange: ClosedRange<Double>) {
+            self.name = name
+            self.reverbRange = reverbRange
+            self.delayRange = delayRange
+            self.cutoffRange = cutoffRange
+            self.duration = duration
+            self.bassFrequencyRange = bassFrequencyRange
+            self.bassGainRange = bassGainRange
+            self.bassBPMRange = bassBPMRange
+        }
+    }
 
-    private var currentMood: Mood?
+    /// Published array of moods, configurable and observable at runtime.
+    @Published public var moods: [Mood]
+
+    /// Currently active mood, published for observing current mood changes
+    @Published public var currentMood: Mood?
+
     private var moodChangeDeadline = Date()
 
     // Targets and current values for easing
@@ -121,7 +144,8 @@ final class AmbientAudioEngine: ObservableObject {
     private var filterDrift: Double = 0
 
     // Gesture state
-    private var gestureActive: Bool = false
+    /// Published gestureActive allows UI to react to swell/gesture events
+    @Published public var gestureActive: Bool = false
     private var gestureEndTime: Date = .distantPast
 
     // Time-based variety events
@@ -135,15 +159,21 @@ final class AmbientAudioEngine: ObservableObject {
     private var swellDuration: TimeInterval = 0
     private var swellCoolUntil: Date = .distantPast
 
-    @Published var volume: Float {
+    @Published public var volume: Float {
         didSet { engine.mainMixerNode.outputVolume = max(0, min(volume, 1)) }
     }
-    @Published private(set) var isPlaying: Bool
+    @Published private(set) public var isPlaying: Bool
 
-    var atmosphereFileName = "atmosphere"
-    var atmosphereFileExtension = "wav"
-    var textureFileName = "chimes"
-    var textureFileExtension = "wav"
+    public var atmosphereFileName = "atmosphere"
+    public var atmosphereFileExtension = "wav"
+    public var textureFileName = "chimes"
+    public var textureFileExtension = "wav"
+
+    // MARK: - Cached audio files to avoid repeated loading and failure spam
+    private var cachedAtmosphereFile: AVAudioFile?
+    private var cachedTextureFile: AVAudioFile?
+    private var atmosphereFileLoadFailed = false
+    private var textureFileLoadFailed = false
 
     // MARK: - Swift Concurrency Tasks for periodic modulation and texture control
 
@@ -153,8 +183,13 @@ final class AmbientAudioEngine: ObservableObject {
     /// Task handling periodic texture playback control
     private var textureTask: Task<Void, Never>?
 
-    /// Initializes the ambient audio engine, configures the audio session and audio nodes.
-    init() {
+    /// Audio file loader instance for dependency injection and testability.
+    private let audioFileLoader: AudioFileLoader
+
+    /// Initializes the ambient audio engine with an injectable audio file loader for testability.
+    /// - Parameter audioFileLoader: An implementation of AudioFileLoader. Defaults to the real bundle loader.
+    public init(audioFileLoader: AudioFileLoader = DefaultAudioFileLoader()) {
+        self.audioFileLoader = audioFileLoader
         self.engine = AVAudioEngine()
         self.player = AVAudioPlayerNode()
         self.reverb = AVAudioUnitReverb()
@@ -163,18 +198,81 @@ final class AmbientAudioEngine: ObservableObject {
         self.volume = 0.5
         self.isPlaying = false
 
-        // Audio session configuration is not applicable on macOS.
-        configureNodes()
+        // Initialize default moods with public struct
+        self.moods = [
+            Mood(
+                name: "Calm",
+                reverbRange: 20...40,
+                delayRange: 10...25,
+                cutoffRange: 4000...7000,
+                duration: 45...90,
+                bassFrequencyRange: 40...52,   // deeper
+                bassGainRange: 0.20...0.35,    // softer
+                bassBPMRange: 50...60          // slower to moderate
+            ),
+            Mood(
+                name: "Misty",
+                reverbRange: 35...55,
+                delayRange: 15...30,
+                cutoffRange: 2500...5500,
+                duration: 60...120,
+                bassFrequencyRange: 45...58,
+                bassGainRange: 0.22...0.38,
+                bassBPMRange: 55...65
+            ),
+            Mood(
+                name: "Dense",
+                reverbRange: 50...70,
+                delayRange: 25...45,
+                cutoffRange: 1500...4000,
+                duration: 45...75,
+                bassFrequencyRange: 50...65,   // a bit higher to cut through
+                bassGainRange: 0.30...0.45,    // slightly louder
+                bassBPMRange: 60...75          // faster
+            ),
+            Mood(
+                name: "Sparkly",
+                reverbRange: 25...45,
+                delayRange: 10...30,
+                cutoffRange: 6000...12000,
+                duration: 30...60,
+                bassFrequencyRange: 48...60,
+                bassGainRange: 0.22...0.38,
+                bassBPMRange: 58...70
+            )
+        ]
+
+        // Platform-dependent audio session configuration:
+        // On macOS, AVAudioSession is not used and is skipped.
+        // On iOS/tvOS/watchOS, configure AVAudioSession for playback.
+        configureAudioSession()
+
+        // Create and attach bass and noise nodes once to improve reuse and avoid detachment on stop/start.
+        self.bassNode = makeBassNode(frequency: bassFrequency, bpm: bassBPM, gain: bassGain)
+        self.noiseNode = makePinkNoiseNode(level: Double(noiseGain))
+
         attachAndConnectNodes()
+        configureNodes()
         chooseNextMood()
     }
 
-    @available(iOS, unavailable)
-    @available(tvOS, unavailable)
-    @available(watchOS, unavailable)
+    #if os(macOS)
+    /// On macOS, AVAudioSession is unavailable; no configuration needed.
     private func configureAudioSession() {
         // AVAudioSession is unavailable on macOS. No configuration needed for macOS playback.
     }
+    #else
+    /// Configure AVAudioSession for playback on iOS/tvOS/watchOS.
+    private func configureAudioSession() {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setCategory(.playback, mode: .default)
+            try session.setActive(true, options: [])
+        } catch {
+            print("AmbientAudioEngine: Failed to configure AVAudioSession: \(error)")
+        }
+    }
+    #endif
 
     private func configureNodes() {
         // Reverb preset and initial wetDryMix
@@ -212,6 +310,20 @@ final class AmbientAudioEngine: ObservableObject {
         noiseLowpass.bypass = !noiseEnabled
     }
 
+    private func updateBassNode() {
+        // Remove old bass node and recreate with updated parameters
+        if let bass = bassNode {
+            if engine.attachedNodes.contains(bass) {
+                engine.detach(bass)
+            }
+        }
+        bassNode = makeBassNode(frequency: bassFrequency, bpm: bassBPM, gain: bassGain)
+        if let bass = bassNode {
+            engine.attach(bass)
+            engine.connect(bass, to: engine.mainMixerNode, format: nil)
+        }
+    }
+
     private func makeBassNode(frequency: Double, bpm: Double, gain: Double) -> AVAudioSourceNode {
         var phase: Double = 0
         var time: Double = 0
@@ -226,11 +338,6 @@ final class AmbientAudioEngine: ObservableObject {
             let frames = Int(frameCount)
 
             // Determine sample rate from the output format only once
-            if cachedSampleRate == 0, let format = abl.first?.mData?.assumingMemoryBound(to: Float.self) {
-                // Fallback to common sample rates if format is not informative; AVAudioEngine will set real rate
-                cachedSampleRate = 44100
-                _ = format // silence unused warning
-            }
             if cachedSampleRate == 0 {
                 cachedSampleRate = 44100
             }
@@ -312,15 +419,13 @@ final class AmbientAudioEngine: ObservableObject {
         engine.attach(atmosphereMixer)
         engine.attach(textureMixer)
 
-        // Create and attach bass synth node
-        let bass = makeBassNode(frequency: bassFrequency, bpm: bassBPM, gain: bassGain)
-        self.bassNode = bass
-        engine.attach(bass)
-
-        // Attach and connect noise chain
-        let noise = makePinkNoiseNode(level: Double(noiseGain))
-        self.noiseNode = noise
-        engine.attach(noise)
+        // Attach bass and noise nodes created once at init
+        if let bass = bassNode {
+            engine.attach(bass)
+        }
+        if let noise = noiseNode {
+            engine.attach(noise)
+        }
         engine.attach(noiseLowpass)
 
         let mainMixer = engine.mainMixerNode
@@ -338,10 +443,14 @@ final class AmbientAudioEngine: ObservableObject {
         textureMixer.outputVolume = 1.2
 
         // Bass goes straight to main mixer (dry). You can route through effects if desired.
-        engine.connect(bass, to: mainMixer, format: nil)
+        if let bass = bassNode {
+            engine.connect(bass, to: mainMixer, format: nil)
+        }
 
         // Noise chain: noise -> noiseLowpass -> mainMixer
-        engine.connect(noise, to: noiseLowpass, format: nil)
+        if let noise = noiseNode {
+            engine.connect(noise, to: noiseLowpass, format: nil)
+        }
         engine.connect(noiseLowpass, to: mainMixer, format: nil)
 
         mainMixer.outputVolume = volume
@@ -350,42 +459,63 @@ final class AmbientAudioEngine: ObservableObject {
         noiseLowpass.bypass = !noiseEnabled
     }
 
+    // MARK: - Audio file loading with caching and failure suppression
+
+    /// Loads and schedules the atmosphere loop file, caching it to avoid repeated disk access and error logs.
     private func loadAndScheduleLoop() {
-        guard let url = Bundle.main.url(forResource: atmosphereFileName, withExtension: atmosphereFileExtension) else {
-            print("AmbientAudioEngine: Audio file \(atmosphereFileName).\(atmosphereFileExtension) not found in bundle.")
+        // If cached file is available, use it
+        if let cached = cachedAtmosphereFile {
+            scheduleLoop(audioFile: cached)
+            return
+        }
+        // If previously failed to load, skip trying again to avoid spamming logs
+        if atmosphereFileLoadFailed { return }
+
+        guard let audioFile = audioFileLoader.loadAudioFile(named: atmosphereFileName, extension: atmosphereFileExtension) else {
+            if !atmosphereFileLoadFailed {
+                print("AmbientAudioEngine: Audio file \(atmosphereFileName).\(atmosphereFileExtension) not found in bundle.")
+                atmosphereFileLoadFailed = true
+            }
             return
         }
 
-        do {
-            let audioFile = try AVAudioFile(forReading: url)
-            scheduleLoop(audioFile: audioFile)
-        } catch {
-            print("AmbientAudioEngine: Failed to load audio file: \(error)")
-        }
+        cachedAtmosphereFile = audioFile
+        atmosphereFileLoadFailed = false
+        scheduleLoop(audioFile: audioFile)
     }
 
+    /// Loads the texture audio file once and caches it.
     private func loadTextureFile() {
-        guard textureFile == nil else { return }
-        guard let url = Bundle.main.url(forResource: textureFileName, withExtension: textureFileExtension) else {
-            print("AmbientAudioEngine: texture file \(textureFileName).\(textureFileExtension) not found in bundle.")
+        // Already have cached texture file, do nothing
+        if cachedTextureFile != nil || textureFileLoadFailed { return }
+
+        guard let audioFile = audioFileLoader.loadAudioFile(named: textureFileName, extension: textureFileExtension) else {
+            if !textureFileLoadFailed {
+                print("AmbientAudioEngine: texture file \(textureFileName).\(textureFileExtension) not found in bundle.")
+                textureFileLoadFailed = true
+            }
             return
         }
-        do {
-            textureFile = try AVAudioFile(forReading: url)
-        } catch {
-            print("AmbientAudioEngine: Failed to load texture (\(textureFileName).\(textureFileExtension)): \(error)")
-        }
+        cachedTextureFile = audioFile
+        textureFileLoadFailed = false
     }
 
+    /// Schedules the atmosphere loop using cached audio file.
     private func scheduleLoop(audioFile: AVAudioFile) {
         player.scheduleFile(audioFile, at: nil, completionHandler: { [weak self] in
+            // Schedule next loop iteration safely without retain cycles
             guard let self = self else { return }
-            self.scheduleLoop(audioFile: audioFile)
+            Task { @MainActor in
+                if let cachedFile = self.cachedAtmosphereFile {
+                    self.scheduleLoop(audioFile: cachedFile)
+                }
+            }
         })
     }
 
+    /// Schedules texture playback only if cached file is available.
     private func scheduleTextureIfNeeded() {
-        guard let file = textureFile else { return }
+        guard let file = cachedTextureFile else { return }
         // If the player has no pending buffers, schedule once from start
         if texturePlayer.outputFormat(forBus: 0).channelCount > 0 { /* noop for format access */ }
         texturePlayer.stop()
@@ -394,7 +524,7 @@ final class AmbientAudioEngine: ObservableObject {
     }
 
     /// Starts the ambient audio engine and begins playback with evolving effects.
-    func start() {
+    public func start() {
         // Ensure engine is running
         if !engine.isRunning {
             do {
@@ -416,16 +546,22 @@ final class AmbientAudioEngine: ObservableObject {
         print("AmbientAudioEngine: Scheduled loop and starting playback.")
 
         player.play()
-        _ = noiseNode // keep strong ref
-        // Bass source node runs as part of the engine graph; nothing to schedule.
-        _ = bassNode // keep strong ref
+        // Start noise and bass nodes if needed (noiseNode and bassNode are source nodes, they produce audio on their own)
+        if let noise = noiseNode {
+            // noiseNode is connected to engine; no explicit start needed
+            _ = noise
+        }
+        if let bass = bassNode {
+            // bassNode is connected to engine; no explicit start needed
+            _ = bass
+        }
         isPlaying = true
         startModulationTask()
         startTextureTask()
     }
 
     /// Stops the ambient audio playback and effect modulations.
-    func stop() {
+    public func stop() {
         if player.isPlaying {
             player.stop()
         }
@@ -443,41 +579,57 @@ final class AmbientAudioEngine: ObservableObject {
 
         isPlaying = false
 
-        if let nn = noiseNode {
-            engine.detach(nn)
-            noiseNode = nil
-        }
-
-        // Recreate bass node next time to reset its phase/time
-        if let bass = bassNode {
-            engine.detach(bass)
-            bassNode = nil
-        }
+        // Instead of detaching and nil-ing nodes on stop, just let them remain attached for reuse.
+        // Noise and bass nodes do not have .stop() method; they run as part of the engine graph.
+        // Stopping engine or stopping player is sufficient to halt audible output.
     }
 
     /// Sets the output volume of the audio engine.
     /// - Parameter value: Volume level between 0.0 and 1.0.
-    func setVolume(_ value: Float) {
+    public func setVolume(_ value: Float) {
         let clamped = max(0, min(value, 1))
         volume = clamped
         engine.mainMixerNode.outputVolume = clamped
     }
 
     /// Tears down the audio engine and releases resources.
-    func teardown() {
+    public func teardown() {
         stop()
+
+        cachedAtmosphereFile = nil
+        cachedTextureFile = nil
+        atmosphereFileLoadFailed = false
+        textureFileLoadFailed = false
+
+        // Detach and nil noiseNode and bassNode on full teardown
+        if let nn = noiseNode {
+            engine.detach(nn)
+            noiseNode = nil
+        }
+
+        if let bass = bassNode {
+            engine.detach(bass)
+            bassNode = nil
+        }
+
         engine.stop()
     }
 
+    @MainActor
     deinit {
+        // Cancel any running tasks and teardown to avoid leaks
+        modulationTask?.cancel()
+        textureTask?.cancel()
         teardown()
     }
 
     private func chooseNextMood() {
-        currentMood = moods.randomElement()
-        let moodName = currentMood?.name ?? "nil"
+        // Pick a random mood from the moods array and update published currentMood
+        let newMood = moods.randomElement()
+        currentMood = newMood
+        let moodName = newMood?.name ?? "nil"
         print("currentMood: \(moodName)")
-        guard let m = currentMood else { return }
+        guard let m = newMood else { return }
         let dur = TimeInterval.random(in: m.duration)
         moodChangeDeadline = Date().addingTimeInterval(dur)
         targetReverb = Double.random(in: m.reverbRange)
@@ -491,8 +643,11 @@ final class AmbientAudioEngine: ObservableObject {
         bassBPM = Double.random(in: m.bassBPMRange)
     }
 
-    private func approach(_ current: Double, _ target: Double, rate: Double) -> Double {
-        current + (target - current) * rate
+    /// Exponential smoothing approach to smoothly update current value towards target.
+    /// This blends the current value with the target by a smoothing factor (alpha).
+    /// A higher alpha means faster response; typical values are 0.05 to 0.2.
+    private func approach(_ current: Double, _ target: Double, alpha: Double) -> Double {
+        current + (target - current) * alpha
     }
 
     private func randomWalk(_ value: inout Double, step: Double, min: Double, max: Double) {
@@ -512,16 +667,15 @@ final class AmbientAudioEngine: ObservableObject {
     // MARK: - Swift Concurrency based modulation and texture control
 
     /// Starts the modulation loop using Swift Concurrency Task instead of GCD timers.
+    /// Published properties updated here enable Combine subscribers to react to real-time changes.
     private func startModulationTask() {
         modulationTask?.cancel()
-        modulationTask = Task {
+        modulationTask = Task { [weak self] in
+            guard let self = self else { return }
             // Loop runs every ~500 ms while not cancelled
             while !Task.isCancelled {
-                let startTime = DispatchTime.now()
 
                 // Compute elapsed time in seconds for LFOs and modulations
-                // For continuous phase, track elapsed time since task start
-                // We'll use Date for now since no startTime is persisted across loops
                 let elapsedSeconds = Date().timeIntervalSince1970
 
                 @inline(__always)
@@ -552,29 +706,29 @@ final class AmbientAudioEngine: ObservableObject {
                 let reverbWetDrySecondary: Double = 5.0 * sin(((2.0 * Double.pi) / 90.0) * elapsedSeconds)
 
                 // Pan random-walk drifts for organic stereo movement
-                randomWalk(&atmospherePanDrift, step: 0.005, min: -0.35, max: 0.35)
-                randomWalk(&texturePanDrift, step: 0.003, min: -0.15, max: 0.15)
+                self.randomWalk(&self.atmospherePanDrift, step: 0.005, min: -0.35, max: 0.35)
+                self.randomWalk(&self.texturePanDrift, step: 0.003, min: -0.15, max: 0.15)
 
                 // Mood timing and target updates
                 let nowDate: Date = Date()
-                if nowDate >= moodChangeDeadline {
-                    chooseNextMood()
+                if nowDate >= self.moodChangeDeadline {
+                    self.chooseNextMood()
                 }
 
-                // Smoothly approach mood targets; small rate for slow easing
-                let approachRate: Double = 0.02
-                currentReverb = approach(currentReverb, targetReverb, rate: approachRate)
-                currentDelay  = approach(currentDelay,  targetDelay,  rate: approachRate)
-                currentCutoff = approach(currentCutoff, targetCutoff, rate: approachRate)
+                // Smoothly approach mood targets using exponential smoothing
+                let smoothingAlpha: Double = 0.02
+                self.currentReverb = self.approach(self.currentReverb, self.targetReverb, alpha: smoothingAlpha)
+                self.currentDelay  = self.approach(self.currentDelay,  self.targetDelay,  alpha: smoothingAlpha)
+                self.currentCutoff = self.approach(self.currentCutoff, self.targetCutoff, alpha: smoothingAlpha)
 
                 // Occasional gesture trigger (low probability)
-                if !gestureActive {
+                if !self.gestureActive {
                     let r: Double = Double.random(in: 0.0...1.0)
-                    if r < 0.02 { triggerReverbSwell() }
+                    if r < 0.02 { self.triggerReverbSwell() }
                 }
-                if gestureActive && nowDate >= gestureEndTime {
-                    gestureActive = false
-                    if let m = currentMood { targetReverb = Double.random(in: m.reverbRange) }
+                if self.gestureActive && nowDate >= self.gestureEndTime {
+                    self.gestureActive = false
+                    if let m = self.currentMood { self.targetReverb = Double.random(in: m.reverbRange) }
                 }
 
                 // Slow pan LFOs (atmosphere roams more)
@@ -585,17 +739,17 @@ final class AmbientAudioEngine: ObservableObject {
                 let texturePanLFO: Double = 0.2 * sin(texturePanOmega * elapsedSeconds + (Double.pi / 3.0))
 
                 // Combine and clamp pan values for submixes
-                let atmosphereCombined: Double = atmospherePanLFO + atmospherePanDrift
-                let textureCombined: Double = texturePanLFO + texturePanDrift
+                let atmosphereCombined: Double = atmospherePanLFO + self.atmospherePanDrift
+                let textureCombined: Double = texturePanLFO + self.texturePanDrift
                 let finalAtmospherePanD: Double = clamp(atmosphereCombined, -1.0, 1.0)
                 let finalTexturePanD: Double = clamp(textureCombined, -1.0, 1.0)
                 let finalAtmospherePanF: Float = Float(finalAtmospherePanD)
                 let finalTexturePanF: Float = Float(finalTexturePanD)
 
                 // Compose final values
-                let reverbSum: Double = reverbWetDryMix + reverbWetDrySecondary + reverbDrift + currentReverb
-                let delaySum: Double  = delayFeedback + delayDrift + currentDelay
-                let cutoffSum: Double = filterCutoff + filterDrift + currentCutoff
+                let reverbSum: Double = reverbWetDryMix + reverbWetDrySecondary + self.reverbDrift + self.currentReverb
+                let delaySum: Double  = delayFeedback + self.delayDrift + self.currentDelay
+                let cutoffSum: Double = filterCutoff + self.filterDrift + self.currentCutoff
 
                 let reverbAveraged: Double = reverbSum / 2.0
                 let delayAveraged: Double  = delaySum / 2.0
@@ -612,29 +766,29 @@ final class AmbientAudioEngine: ObservableObject {
                 // Time-based variety: micro-stutter echoes and diffuse reverse swells
                 let now: Date = Date()
                 // Try to trigger stutter if idle and not cooling
-                if stutterState == .idle && now >= stutterCoolUntil {
+                if self.stutterState == .idle && now >= self.stutterCoolUntil {
                     let chance: Double = Double.random(in: 0.0...1.0)
                     if chance < 0.015 {
-                        stutterState = .active
-                        stutterStart = now
-                        stutterDuration = Double.random(in: 0.18...0.35)
+                        self.stutterState = .active
+                        self.stutterStart = now
+                        self.stutterDuration = Double.random(in: 0.18...0.35)
                     }
                 }
                 // Try to trigger swell if idle and not cooling
-                if swellState == .idle && now >= swellCoolUntil {
+                if self.swellState == .idle && now >= self.swellCoolUntil {
                     let chance: Double = Double.random(in: 0.0...1.0)
                     if chance < 0.008 {
-                        swellState = .active
-                        swellStart = now
-                        swellDuration = Double.random(in: 1.2...2.2)
+                        self.swellState = .active
+                        self.swellStart = now
+                        self.swellDuration = Double.random(in: 1.2...2.2)
                     }
                 }
 
                 // Compute current envelopes
                 var stutterWetBoost: Double = 0.0
-                if stutterState == .active {
-                    let t: TimeInterval = now.timeIntervalSince(stutterStart)
-                    let denom: Double = max(0.05, stutterDuration)
+                if self.stutterState == .active {
+                    let t: TimeInterval = now.timeIntervalSince(self.stutterStart)
+                    let denom: Double = max(0.05, self.stutterDuration)
                     let p: Double = max(0.0, min(1.0, t / denom))
                     // quick up and down (triangle)
                     if p < 0.5 {
@@ -643,76 +797,74 @@ final class AmbientAudioEngine: ObservableObject {
                         let tail: Double = (p - 0.5) / 0.5
                         stutterWetBoost = max(0.0, 1.0 - tail)
                     }
-                    if t >= stutterDuration {
-                        stutterState = .cooling
-                        stutterCoolUntil = now.addingTimeInterval(Double.random(in: 12.0...25.0))
+                    if t >= self.stutterDuration {
+                        self.stutterState = .cooling
+                        self.stutterCoolUntil = now.addingTimeInterval(Double.random(in: 12.0...25.0))
                         stutterWetBoost = 0.0
                     }
-                } else if stutterState == .cooling {
-                    if now >= stutterCoolUntil { stutterState = .idle }
+                } else if self.stutterState == .cooling {
+                    if now >= self.stutterCoolUntil { self.stutterState = .idle }
                 }
 
                 var swellWet: Double = 0.0
                 var swellPreDelay: Double = 0.0
-                if swellState == .active {
-                    let t: TimeInterval = now.timeIntervalSince(swellStart)
-                    let denom: Double = max(0.2, swellDuration)
+                if self.swellState == .active {
+                    let t: TimeInterval = now.timeIntervalSince(self.swellStart)
+                    let denom: Double = max(0.2, self.swellDuration)
                     let p: Double = max(0.0, min(1.0, t / denom))
                     // ease-in-out for smoother swell
                     let eased: Double = 0.5 - 0.5 * cos(p * Double.pi)
                     swellWet = 0.02 * eased // up to +8% wet
                     swellPreDelay = 0.020 + 0.025 * eased // add ~20-45 ms pre-delay
-                    if t >= swellDuration {
-                        swellState = .cooling
-                        swellCoolUntil = now.addingTimeInterval(Double.random(in: 30.0...60.0))
+                    if t >= self.swellDuration {
+                        self.swellState = .cooling
+                        self.swellCoolUntil = now.addingTimeInterval(Double.random(in: 30.0...60.0))
                         swellWet = 0.0
                         swellPreDelay = 0.0
                     }
-                } else if swellState == .cooling {
-                    if now >= swellCoolUntil { swellState = .idle }
+                } else if self.swellState == .cooling {
+                    if now >= self.swellCoolUntil { self.swellState = .idle }
                 }
 
-                // Apply values on main actor for thread safety
-                await MainActor.run {
-                    reverb.wetDryMix = finalReverbF
-                    delay.feedback = finalDelayF
-                    if let band = filter.bands.first {
-                        band.frequency = finalCutoffF
-                    }
-                    // Per-node pan via AVAudioMixerNode submixes
-                    atmosphereMixer.pan = finalAtmospherePanF
-                    textureMixer.pan = finalTexturePanF
-
-                    // Noise bed slow modulation (very subtle)
-                    if noiseEnabled, let nband = noiseLowpass.bands.first {
-                        // Very slow LFOs
-                        let volOmega: Double = (2.0 * Double.pi) / 240.0
-                        let cutoffOmega: Double = (2.0 * Double.pi) / 300.0
-                        let volLFO: Double = 0.5 + 0.5 * sin(volOmega * elapsedSeconds)
-                        let cutoffLFO: Double = sin(cutoffOmega * elapsedSeconds + 0.7)
-                        let targetCut: Double = noiseCutoffBase + noiseCutoffRange * cutoffLFO
-                        let clampedCut: Double = max(1000.0, min(20000.0, targetCut))
-                        nband.frequency = Float(clampedCut)
-                        // Set output volume on the EQ node to control noise level
-                        let noiseGainLinear: Double = Double(noiseGain)
-                        let globalGain: Double = (noiseGainLinear * volLFO) * 10.0
-                        noiseLowpass.globalGain = Float(globalGain)
-                    }
-
-                    // Apply micro-stutter: temporarily bump delay wet mix slightly
-                    let baseWet: Float = 12.0
-                    let stutterBoost: Float = 10.0 * Float(stutterWetBoost) // up to +10%
-                    delay.wetDryMix = baseWet + stutterBoost
-
-                    // Apply diffuse reverse swell: modulate reverb wet and pre-delay
-                    // Preserve the evolving wetDryMix by adding a small swell component
-                    let swellWetAdd: Float = Float(swellWet * 100.0) // convert to percent
-                    let newWet: Float = max(0.0, min(100.0, reverb.wetDryMix + swellWetAdd))
-                    reverb.wetDryMix = newWet
-                    // AVAudioUnitReverb doesn't expose a preDelay parameter. Approximate it by nudging
-                    // the existing delay node's delay time around its 1.0s baseline during swells.
-                    delay.delayTime = 1.0 + swellPreDelay
+                // Apply values directly since we're main actor isolated
+                self.reverb.wetDryMix = finalReverbF
+                self.delay.feedback = finalDelayF
+                if let band = self.filter.bands.first {
+                    band.frequency = finalCutoffF
                 }
+                // Per-node pan via AVAudioMixerNode submixes
+                self.atmosphereMixer.pan = finalAtmospherePanF
+                self.textureMixer.pan = finalTexturePanF
+
+                // Noise bed slow modulation (very subtle)
+                if self.noiseEnabled, let nband = self.noiseLowpass.bands.first {
+                    // Very slow LFOs
+                    let volOmega: Double = (2.0 * Double.pi) / 240.0
+                    let cutoffOmega: Double = (2.0 * Double.pi) / 300.0
+                    let volLFO: Double = 0.5 + 0.5 * sin(volOmega * elapsedSeconds)
+                    let cutoffLFO: Double = sin(cutoffOmega * elapsedSeconds + 0.7)
+                    let targetCut: Double = self.noiseCutoffBase + self.noiseCutoffRange * cutoffLFO
+                    let clampedCut: Double = max(1000.0, min(20000.0, targetCut))
+                    nband.frequency = Float(clampedCut)
+                    // Set output volume on the EQ node to control noise level
+                    let noiseGainLinear: Double = Double(self.noiseGain)
+                    let globalGain: Double = (noiseGainLinear * volLFO) * 10.0
+                    self.noiseLowpass.globalGain = Float(globalGain)
+                }
+
+                // Apply micro-stutter: temporarily bump delay wet mix slightly
+                let baseWet: Float = 12.0
+                let stutterBoost: Float = 10.0 * Float(stutterWetBoost) // up to +10%
+                self.delay.wetDryMix = baseWet + stutterBoost
+
+                // Apply diffuse reverse swell: modulate reverb wet and pre-delay
+                // Preserve the evolving wetDryMix by adding a small swell component
+                let swellWetAdd: Float = Float(swellWet * 100.0) // convert to percent
+                let newWet: Float = max(0.0, min(100.0, self.reverb.wetDryMix + swellWetAdd))
+                self.reverb.wetDryMix = newWet
+                // AVAudioUnitReverb doesn't expose a preDelay parameter. Approximate it by nudging
+                // the existing delay node's delay time around its 1.0s baseline during swells.
+                self.delay.delayTime = 1.0 + swellPreDelay
 
                 // Sleep for ~500 ms, but respond to cancellation immediately
                 try? await Task.sleep(nanoseconds: 500_000_000)
@@ -723,9 +875,11 @@ final class AmbientAudioEngine: ObservableObject {
     }
 
     /// Starts the texture playback control loop using Swift Concurrency Task instead of GCD timers.
+    /// Updates published textureState and textureCurrentVolume for UI observation and reactive updates.
     private func startTextureTask() {
         textureTask?.cancel()
-        textureTask = Task {
+        textureTask = Task { [weak self] in
+            guard let self = self else { return }
             var nextActionTime = Date()
             var fadeStartTime = Date()
             var fadeDuration: TimeInterval = 0
@@ -734,16 +888,16 @@ final class AmbientAudioEngine: ObservableObject {
             while !Task.isCancelled {
                 let now = Date()
 
-                switch textureState {
+                switch self.textureState {
                 case .idle:
                     // Randomly decide to start after a random delay (1-10s)
                     if now >= nextActionTime {
                         // 10% chance each tick to begin a fade-in sequence
                         if Double.random(in: 0...1) < 0.1 {
-                            loadTextureFile()
-                            scheduleTextureIfNeeded()
-                            if !texturePlayer.isPlaying { texturePlayer.play() }
-                            textureState = .fadingIn
+                            self.loadTextureFile()
+                            self.scheduleTextureIfNeeded()
+                            if !self.texturePlayer.isPlaying { self.texturePlayer.play() }
+                            self.textureState = .fadingIn
                             fadeStartTime = now
                             fadeDuration = Double.random(in: 1.0...3.0)
                             nextActionTime = .distantFuture
@@ -755,19 +909,17 @@ final class AmbientAudioEngine: ObservableObject {
                 case .fadingIn:
                     let t = now.timeIntervalSince(fadeStartTime)
                     let progress = min(1.0, max(0.0, t / max(0.1, fadeDuration)))
-                    textureCurrentVolume = Float(progress) * textureTargetVolume
-                    await MainActor.run {
-                        texturePlayer.volume = textureCurrentVolume
-                    }
+                    self.textureCurrentVolume = Float(progress) * self.textureTargetVolume
+                    self.texturePlayer.volume = self.textureCurrentVolume
                     if progress >= 1.0 {
-                        textureState = .playing
+                        self.textureState = .playing
                         // Decide random play time before fading out
                         nextActionTime = now.addingTimeInterval(Double.random(in: 12.0...28.0))
                     }
 
                 case .playing:
                     if now >= nextActionTime {
-                        textureState = .fadingOut
+                        self.textureState = .fadingOut
                         fadeStartTime = now
                         fadeDuration = Double.random(in: 3.0...7.0)
                     }
@@ -775,15 +927,11 @@ final class AmbientAudioEngine: ObservableObject {
                 case .fadingOut:
                     let t = now.timeIntervalSince(fadeStartTime)
                     let progress = min(1.0, max(0.0, t / max(0.1, fadeDuration)))
-                    textureCurrentVolume = (1.0 - Float(progress)) * textureTargetVolume
-                    await MainActor.run {
-                        texturePlayer.volume = textureCurrentVolume
-                    }
+                    self.textureCurrentVolume = (1.0 - Float(progress)) * self.textureTargetVolume
+                    self.texturePlayer.volume = self.textureCurrentVolume
                     if progress >= 1.0 {
-                        await MainActor.run {
-                            texturePlayer.stop()
-                        }
-                        textureState = .cooldown
+                        self.texturePlayer.stop()
+                        self.textureState = .cooldown
                         // Ensure at least 20 seconds of silence
                         nextActionTime = now.addingTimeInterval(20.0 + Double.random(in: 0...20.0))
                     }
@@ -791,11 +939,9 @@ final class AmbientAudioEngine: ObservableObject {
                 case .cooldown:
                     // Wait for cooldown to expire, then return to idle
                     if now >= nextActionTime {
-                        textureState = .idle
-                        textureCurrentVolume = 0
-                        await MainActor.run {
-                            texturePlayer.volume = 0
-                        }
+                        self.textureState = .idle
+                        self.textureCurrentVolume = 0
+                        self.texturePlayer.volume = 0
                     }
                 }
 
@@ -805,6 +951,43 @@ final class AmbientAudioEngine: ObservableObject {
                 if Task.isCancelled { break }
             }
         }
+    }
+
+    // MARK: - Public runtime configuration methods
+    /// Adds a new mood to the moods list.
+    /// - Parameter mood: The Mood to add.
+    public func addMood(_ mood: Mood) {
+        if !moods.contains(mood) {
+            moods.append(mood)
+        }
+    }
+
+    /// Removes a mood by name from the moods list.
+    /// - Parameter named: The name of the mood to remove.
+    public func removeMood(named name: String) {
+        moods.removeAll { $0.name == name }
+    }
+
+    /// Replaces the entire moods list with a new list.
+    /// - Parameter moods: The new array of Mood objects.
+    public func replaceMoods(with moods: [Mood]) {
+        self.moods = moods
+    }
+
+    /// Sets noise parameters for color and gain.
+    /// - Parameters:
+    ///   - gain: Linear gain (0..1) for noise level.
+    ///   - cutoffBase: Base cutoff frequency in Hz for noise low-pass filter.
+    ///   - cutoffRange: Range (+/-) in Hz for cutoff modulation.
+    public func setNoiseParameters(gain: Float, cutoffBase: Double, cutoffRange: Double) {
+        noiseGain = gain
+        noiseCutoffBase = cutoffBase
+        noiseCutoffRange = cutoffRange
+
+        if let nband = noiseLowpass.bands.first {
+            nband.frequency = Float(noiseCutoffBase)
+        }
+        noiseLowpass.globalGain = noiseGain * 10.0
     }
 }
 
