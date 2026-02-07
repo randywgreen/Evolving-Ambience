@@ -29,7 +29,6 @@ final class AmbientAudioEngine: ObservableObject {
     // Texture player and scheduling state
     private let texturePlayer = AVAudioPlayerNode()
     private var textureFile: AVAudioFile?
-    private var textureTimer: DispatchSourceTimer?
     private var textureTargetVolume: Float = 0.55
     private var textureCurrentVolume: Float = 0.0
     private var textureState: TextureState = .idle
@@ -139,13 +138,20 @@ final class AmbientAudioEngine: ObservableObject {
     @Published var volume: Float {
         didSet { engine.mainMixerNode.outputVolume = max(0, min(volume, 1)) }
     }
-    private var timer: DispatchSourceTimer?
     @Published private(set) var isPlaying: Bool
 
     var atmosphereFileName = "atmosphere"
     var atmosphereFileExtension = "wav"
     var textureFileName = "chimes"
     var textureFileExtension = "wav"
+
+    // MARK: - Swift Concurrency Tasks for periodic modulation and texture control
+
+    /// Task handling periodic modulation updates
+    private var modulationTask: Task<Void, Never>?
+
+    /// Task handling periodic texture playback control
+    private var textureTask: Task<Void, Never>?
 
     /// Initializes the ambient audio engine, configures the audio session and audio nodes.
     init() {
@@ -414,8 +420,8 @@ final class AmbientAudioEngine: ObservableObject {
         // Bass source node runs as part of the engine graph; nothing to schedule.
         _ = bassNode // keep strong ref
         isPlaying = true
-        startModulationTimer()
-        startTextureTimer()
+        startModulationTask()
+        startTextureTask()
     }
 
     /// Stops the ambient audio playback and effect modulations.
@@ -423,11 +429,13 @@ final class AmbientAudioEngine: ObservableObject {
         if player.isPlaying {
             player.stop()
         }
-        timer?.cancel()
-        timer = nil
 
-        textureTimer?.cancel()
-        textureTimer = nil
+        modulationTask?.cancel()
+        modulationTask = nil
+
+        textureTask?.cancel()
+        textureTask = nil
+
         if texturePlayer.isPlaying { texturePlayer.stop() }
         textureState = .idle
         textureCurrentVolume = 0
@@ -501,302 +509,302 @@ final class AmbientAudioEngine: ObservableObject {
         targetReverb = min(100.0, targetReverb + amount)
     }
 
-    private func startModulationTimer() {
-        // Cancel any previous timer
-        timer?.cancel()
+    // MARK: - Swift Concurrency based modulation and texture control
 
-        // Create a new timer on a background queue
-        let queue: DispatchQueue = DispatchQueue.global(qos: .background)
-        let newTimer: DispatchSourceTimer = DispatchSource.makeTimerSource(queue: queue)
-        timer = newTimer
+    /// Starts the modulation loop using Swift Concurrency Task instead of GCD timers.
+    private func startModulationTask() {
+        modulationTask?.cancel()
+        modulationTask = Task {
+            // Loop runs every ~500 ms while not cancelled
+            while !Task.isCancelled {
+                let startTime = DispatchTime.now()
 
-        // Use explicit numeric types to avoid type inference explosions
-        let repeatInterval: DispatchTimeInterval = .milliseconds(500)
-        let leeway: DispatchTimeInterval = .milliseconds(100)
+                // Compute elapsed time in seconds for LFOs and modulations
+                // For continuous phase, track elapsed time since task start
+                // We'll use Date for now since no startTime is persisted across loops
+                let elapsedSeconds = Date().timeIntervalSince1970
 
-        newTimer.schedule(deadline: .now(), repeating: repeatInterval, leeway: leeway)
-
-        // Capture the start time once
-        let startTime: DispatchTime = DispatchTime.now()
-
-        newTimer.setEventHandler { [weak self] in
-            guard let strongSelf = self else { return }
-
-            // Compute elapsed time in seconds with explicit typing
-            let nowDispatch: DispatchTime = DispatchTime.now()
-            let startNanos: UInt64 = startTime.uptimeNanoseconds
-            let nowNanos: UInt64 = nowDispatch.uptimeNanoseconds
-            let elapsedNanos: UInt64 = nowNanos &- startNanos
-            let elapsedSeconds: Double = Double(elapsedNanos) / 1_000_000_000.0
-
-            // Local helpers with explicit types
-            @inline(__always)
-            func sineWave(period: Double, amplitude: Double, offset: Double = 0.0, t: Double) -> Double {
-                let omega: Double = (2.0 * Double.pi) / period
-                let angle: Double = (omega * t) + offset
-                return amplitude * sin(angle)
-            }
-            @inline(__always)
-            func clamp(_ x: Double, _ lo: Double, _ hi: Double) -> Double { return max(lo, min(hi, x)) }
-
-            // Base modulations (explicit intermediate variables)
-            let reverbWetDryBase: Double = 30.0
-            let reverbWetDryRange: Double = 20.0
-            let reverbPrimary: Double = sineWave(period: 60.0, amplitude: reverbWetDryRange, t: elapsedSeconds)
-            let reverbWetDryMix: Double = reverbWetDryBase + reverbPrimary
-
-            let delayFeedbackBase: Double = 20.0
-            let delayFeedbackRange: Double = 15.0
-            let delayPrimary: Double = sineWave(period: 120.0, amplitude: delayFeedbackRange, offset: Double.pi / 4.0, t: elapsedSeconds)
-            let delayFeedback: Double = delayFeedbackBase + delayPrimary
-
-            let filterCutoffBase: Double = 5000.0
-            let filterCutoffRange: Double = 3500.0
-            let filterPrimary: Double = sineWave(period: 180.0, amplitude: filterCutoffRange, offset: Double.pi / 2.0, t: elapsedSeconds)
-            let filterCutoff: Double = filterCutoffBase + filterPrimary
-
-            let reverbWetDrySecondary: Double = 5.0 * sin(((2.0 * Double.pi) / 90.0) * elapsedSeconds)
-
-            // Pan random-walk drifts for organic stereo movement
-            strongSelf.randomWalk(&strongSelf.atmospherePanDrift, step: 0.005, min: -0.35, max: 0.35)
-            strongSelf.randomWalk(&strongSelf.texturePanDrift, step: 0.003, min: -0.15, max: 0.15)
-
-            // Mood timing and target updates
-            let nowDate: Date = Date()
-            if nowDate >= strongSelf.moodChangeDeadline {
-                strongSelf.chooseNextMood()
-            }
-
-            // Smoothly approach mood targets; small rate for slow easing
-            let approachRate: Double = 0.02
-            strongSelf.currentReverb = strongSelf.approach(strongSelf.currentReverb, strongSelf.targetReverb, rate: approachRate)
-            strongSelf.currentDelay  = strongSelf.approach(strongSelf.currentDelay,  strongSelf.targetDelay,  rate: approachRate)
-            strongSelf.currentCutoff = strongSelf.approach(strongSelf.currentCutoff, strongSelf.targetCutoff, rate: approachRate)
-
-            // Occasional gesture trigger (low probability)
-            if !strongSelf.gestureActive {
-                let r: Double = Double.random(in: 0.0...1.0)
-                if r < 0.02 { strongSelf.triggerReverbSwell() }
-            }
-            if strongSelf.gestureActive && nowDate >= strongSelf.gestureEndTime {
-                strongSelf.gestureActive = false
-                if let m = strongSelf.currentMood { strongSelf.targetReverb = Double.random(in: m.reverbRange) }
-            }
-
-            // Slow pan LFOs (atmosphere roams more)
-            let twoPi: Double = 2.0 * Double.pi
-            let atmospherePanOmega: Double = twoPi / 150.0
-            let texturePanOmega: Double = twoPi / 120.0
-            let atmospherePanLFO: Double = 0.5 * sin(atmospherePanOmega * elapsedSeconds)
-            let texturePanLFO: Double = 0.2 * sin(texturePanOmega * elapsedSeconds + (Double.pi / 3.0))
-
-            // Combine and clamp pan values for submixes
-            let atmosphereCombined: Double = atmospherePanLFO + strongSelf.atmospherePanDrift
-            let textureCombined: Double = texturePanLFO + strongSelf.texturePanDrift
-            let finalAtmospherePanD: Double = clamp(atmosphereCombined, -1.0, 1.0)
-            let finalTexturePanD: Double = clamp(textureCombined, -1.0, 1.0)
-            let finalAtmospherePanF: Float = Float(finalAtmospherePanD)
-            let finalTexturePanF: Float = Float(finalTexturePanD)
-
-            // Compose final values with explicit steps
-            let reverbSum: Double = reverbWetDryMix + reverbWetDrySecondary + strongSelf.reverbDrift + strongSelf.currentReverb
-            let delaySum: Double  = delayFeedback + strongSelf.delayDrift + strongSelf.currentDelay
-            let cutoffSum: Double = filterCutoff + strongSelf.filterDrift + strongSelf.currentCutoff
-
-            let reverbAveraged: Double = reverbSum / 2.0
-            let delayAveraged: Double  = delaySum / 2.0
-            let cutoffAveraged: Double = cutoffSum / 2.0
-
-            let finalReverbD: Double = clamp(reverbAveraged, 0.0, 100.0)
-            let finalDelayD: Double  = clamp(delayAveraged, 0.0, 100.0)
-            let finalCutoffD: Double = clamp(cutoffAveraged, 100.0, 22_000.0)
-
-            let finalReverbF: Float = Float(finalReverbD)
-            let finalDelayF: Float  = Float(finalDelayD)
-            let finalCutoffF: Float = Float(finalCutoffD)
-
-            // Time-based variety: micro-stutter echoes and diffuse reverse swells
-            let now: Date = Date()
-            // Try to trigger stutter if idle and not cooling
-            if strongSelf.stutterState == .idle && now >= strongSelf.stutterCoolUntil {
-                let chance: Double = Double.random(in: 0.0...1.0)
-                if chance < 0.015 {
-                    strongSelf.stutterState = .active
-                    strongSelf.stutterStart = now
-                    strongSelf.stutterDuration = Double.random(in: 0.18...0.35)
+                @inline(__always)
+                func sineWave(period: Double, amplitude: Double, offset: Double = 0.0, t: Double) -> Double {
+                    let omega: Double = (2.0 * Double.pi) / period
+                    let angle: Double = (omega * t) + offset
+                    return amplitude * sin(angle)
                 }
-            }
-            // Try to trigger swell if idle and not cooling
-            if strongSelf.swellState == .idle && now >= strongSelf.swellCoolUntil {
-                let chance: Double = Double.random(in: 0.0...1.0)
-                if chance < 0.008 {
-                    strongSelf.swellState = .active
-                    strongSelf.swellStart = now
-                    strongSelf.swellDuration = Double.random(in: 1.2...2.2)
-                }
-            }
+                @inline(__always)
+                func clamp(_ x: Double, _ lo: Double, _ hi: Double) -> Double { return max(lo, min(hi, x)) }
 
-            // Compute current envelopes
-            var stutterWetBoost: Double = 0.0
-            if strongSelf.stutterState == .active {
-                let t: TimeInterval = now.timeIntervalSince(strongSelf.stutterStart)
-                let denom: Double = max(0.05, strongSelf.stutterDuration)
-                let p: Double = max(0.0, min(1.0, t / denom))
-                // quick up and down (triangle)
-                if p < 0.5 {
-                    stutterWetBoost = p / 0.5
-                } else {
-                    let tail: Double = (p - 0.5) / 0.5
-                    stutterWetBoost = max(0.0, 1.0 - tail)
-                }
-                if t >= strongSelf.stutterDuration {
-                    strongSelf.stutterState = .cooling
-                    strongSelf.stutterCoolUntil = now.addingTimeInterval(Double.random(in: 12.0...25.0))
-                    stutterWetBoost = 0.0
-                }
-            } else if strongSelf.stutterState == .cooling {
-                if now >= strongSelf.stutterCoolUntil { strongSelf.stutterState = .idle }
-            }
+                // Base modulations
+                let reverbWetDryBase: Double = 30.0
+                let reverbWetDryRange: Double = 20.0
+                let reverbPrimary: Double = sineWave(period: 60.0, amplitude: reverbWetDryRange, t: elapsedSeconds)
+                let reverbWetDryMix: Double = reverbWetDryBase + reverbPrimary
 
-            var swellWet: Double = 0.0
-            var swellPreDelay: Double = 0.0
-            if strongSelf.swellState == .active {
-                let t: TimeInterval = now.timeIntervalSince(strongSelf.swellStart)
-                let denom: Double = max(0.2, strongSelf.swellDuration)
-                let p: Double = max(0.0, min(1.0, t / denom))
-                // ease-in-out for smoother swell
-                let eased: Double = 0.5 - 0.5 * cos(p * Double.pi)
-                swellWet = 0.02 * eased // up to +8% wet
-                swellPreDelay = 0.020 + 0.025 * eased // add ~20-45 ms pre-delay
-                if t >= strongSelf.swellDuration {
-                    strongSelf.swellState = .cooling
-                    strongSelf.swellCoolUntil = now.addingTimeInterval(Double.random(in: 30.0...60.0))
-                    swellWet = 0.0
-                    swellPreDelay = 0.0
-                }
-            } else if strongSelf.swellState == .cooling {
-                if now >= strongSelf.swellCoolUntil { strongSelf.swellState = .idle }
-            }
+                let delayFeedbackBase: Double = 20.0
+                let delayFeedbackRange: Double = 15.0
+                let delayPrimary: Double = sineWave(period: 120.0, amplitude: delayFeedbackRange, offset: Double.pi / 4.0, t: elapsedSeconds)
+                let delayFeedback: Double = delayFeedbackBase + delayPrimary
 
-            // Apply values on main queue
-            DispatchQueue.main.async {
-                strongSelf.reverb.wetDryMix = finalReverbF
-                strongSelf.delay.feedback = finalDelayF
-                if let band = strongSelf.filter.bands.first {
-                    band.frequency = finalCutoffF
-                }
-                // Per-node pan via AVAudioMixerNode submixes
-                strongSelf.atmosphereMixer.pan = finalAtmospherePanF
-                strongSelf.textureMixer.pan = finalTexturePanF
+                let filterCutoffBase: Double = 5000.0
+                let filterCutoffRange: Double = 3500.0
+                let filterPrimary: Double = sineWave(period: 180.0, amplitude: filterCutoffRange, offset: Double.pi / 2.0, t: elapsedSeconds)
+                let filterCutoff: Double = filterCutoffBase + filterPrimary
 
-                // Noise bed slow modulation (very subtle)
-                if strongSelf.noiseEnabled, let nband = strongSelf.noiseLowpass.bands.first {
-                    // Very slow LFOs
-                    let volOmega: Double = (2.0 * Double.pi) / 240.0
-                    let cutoffOmega: Double = (2.0 * Double.pi) / 300.0
-                    let volLFO: Double = 0.5 + 0.5 * sin(volOmega * elapsedSeconds)
-                    let cutoffLFO: Double = sin(cutoffOmega * elapsedSeconds + 0.7)
-                    let targetCut: Double = strongSelf.noiseCutoffBase + strongSelf.noiseCutoffRange * cutoffLFO
-                    let clampedCut: Double = max(1000.0, min(20000.0, targetCut))
-                    nband.frequency = Float(clampedCut)
-                    // Set output volume on the EQ node to control noise level
-                    let noiseGainLinear: Double = Double(strongSelf.noiseGain)
-                    let globalGain: Double = (noiseGainLinear * volLFO) * 10.0
-                    strongSelf.noiseLowpass.globalGain = Float(globalGain)
+                let reverbWetDrySecondary: Double = 5.0 * sin(((2.0 * Double.pi) / 90.0) * elapsedSeconds)
+
+                // Pan random-walk drifts for organic stereo movement
+                randomWalk(&atmospherePanDrift, step: 0.005, min: -0.35, max: 0.35)
+                randomWalk(&texturePanDrift, step: 0.003, min: -0.15, max: 0.15)
+
+                // Mood timing and target updates
+                let nowDate: Date = Date()
+                if nowDate >= moodChangeDeadline {
+                    chooseNextMood()
                 }
 
-                // Apply micro-stutter: temporarily bump delay wet mix slightly
-                let baseWet: Float = 12.0
-                let stutterBoost: Float = 10.0 * Float(stutterWetBoost) // up to +10%
-                strongSelf.delay.wetDryMix = baseWet + stutterBoost
+                // Smoothly approach mood targets; small rate for slow easing
+                let approachRate: Double = 0.02
+                currentReverb = approach(currentReverb, targetReverb, rate: approachRate)
+                currentDelay  = approach(currentDelay,  targetDelay,  rate: approachRate)
+                currentCutoff = approach(currentCutoff, targetCutoff, rate: approachRate)
 
-                // Apply diffuse reverse swell: modulate reverb wet and pre-delay
-                // Preserve the evolving wetDryMix by adding a small swell component
-                let swellWetAdd: Float = Float(swellWet * 100.0) // convert to percent
-                let newWet: Float = max(0.0, min(100.0, strongSelf.reverb.wetDryMix + swellWetAdd))
-                strongSelf.reverb.wetDryMix = newWet
-                // AVAudioUnitReverb doesn't expose a preDelay parameter. Approximate it by nudging
-                // the existing delay node's delay time around its 1.0s baseline during swells.
-                strongSelf.delay.delayTime = 1.0 + swellPreDelay
-            }
-        }
+                // Occasional gesture trigger (low probability)
+                if !gestureActive {
+                    let r: Double = Double.random(in: 0.0...1.0)
+                    if r < 0.02 { triggerReverbSwell() }
+                }
+                if gestureActive && nowDate >= gestureEndTime {
+                    gestureActive = false
+                    if let m = currentMood { targetReverb = Double.random(in: m.reverbRange) }
+                }
 
-        newTimer.resume()
-    }
+                // Slow pan LFOs (atmosphere roams more)
+                let twoPi: Double = 2.0 * Double.pi
+                let atmospherePanOmega: Double = twoPi / 150.0
+                let texturePanOmega: Double = twoPi / 120.0
+                let atmospherePanLFO: Double = 0.5 * sin(atmospherePanOmega * elapsedSeconds)
+                let texturePanLFO: Double = 0.2 * sin(texturePanOmega * elapsedSeconds + (Double.pi / 3.0))
 
-    private func startTextureTimer() {
-        textureTimer?.cancel()
-        let queue = DispatchQueue.global(qos: .background)
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        textureTimer = timer
-        timer.schedule(deadline: .now(), repeating: 0.25, leeway: .milliseconds(50))
-        // Randomized control variables
-        var nextActionTime = Date()
-        var fadeStartTime = Date()
-        var fadeDuration: TimeInterval = 0
+                // Combine and clamp pan values for submixes
+                let atmosphereCombined: Double = atmospherePanLFO + atmospherePanDrift
+                let textureCombined: Double = texturePanLFO + texturePanDrift
+                let finalAtmospherePanD: Double = clamp(atmosphereCombined, -1.0, 1.0)
+                let finalTexturePanD: Double = clamp(textureCombined, -1.0, 1.0)
+                let finalAtmospherePanF: Float = Float(finalAtmospherePanD)
+                let finalTexturePanF: Float = Float(finalTexturePanD)
 
-        timer.setEventHandler { [weak self] in
-            guard let self = self else { return }
-            let now = Date()
+                // Compose final values
+                let reverbSum: Double = reverbWetDryMix + reverbWetDrySecondary + reverbDrift + currentReverb
+                let delaySum: Double  = delayFeedback + delayDrift + currentDelay
+                let cutoffSum: Double = filterCutoff + filterDrift + currentCutoff
 
-            switch self.textureState {
-            case .idle:
-                // Randomly decide to start after a random delay (1-10s)
-                if now >= nextActionTime {
-                    // 10% chance each tick to begin a fade-in sequence
-                    if Double.random(in: 0...1) < 0.1 {
-                        self.loadTextureFile()
-                        self.scheduleTextureIfNeeded()
-                        if !self.texturePlayer.isPlaying { self.texturePlayer.play() }
-                        self.textureState = .fadingIn
-                        fadeStartTime = now
-                        fadeDuration = Double.random(in: 1.0...3.0)
-                        nextActionTime = .distantFuture
-                    } else {
-                        nextActionTime = now.addingTimeInterval(Double.random(in: 1...10))
+                let reverbAveraged: Double = reverbSum / 2.0
+                let delayAveraged: Double  = delaySum / 2.0
+                let cutoffAveraged: Double = cutoffSum / 2.0
+
+                let finalReverbD: Double = clamp(reverbAveraged, 0.0, 100.0)
+                let finalDelayD: Double  = clamp(delayAveraged, 0.0, 100.0)
+                let finalCutoffD: Double = clamp(cutoffAveraged, 100.0, 22_000.0)
+
+                let finalReverbF: Float = Float(finalReverbD)
+                let finalDelayF: Float  = Float(finalDelayD)
+                let finalCutoffF: Float = Float(finalCutoffD)
+
+                // Time-based variety: micro-stutter echoes and diffuse reverse swells
+                let now: Date = Date()
+                // Try to trigger stutter if idle and not cooling
+                if stutterState == .idle && now >= stutterCoolUntil {
+                    let chance: Double = Double.random(in: 0.0...1.0)
+                    if chance < 0.015 {
+                        stutterState = .active
+                        stutterStart = now
+                        stutterDuration = Double.random(in: 0.18...0.35)
+                    }
+                }
+                // Try to trigger swell if idle and not cooling
+                if swellState == .idle && now >= swellCoolUntil {
+                    let chance: Double = Double.random(in: 0.0...1.0)
+                    if chance < 0.008 {
+                        swellState = .active
+                        swellStart = now
+                        swellDuration = Double.random(in: 1.2...2.2)
                     }
                 }
 
-            case .fadingIn:
-                let t = now.timeIntervalSince(fadeStartTime)
-                let progress = min(1.0, max(0.0, t / max(0.1, fadeDuration)))
-                self.textureCurrentVolume = Float(progress) * self.textureTargetVolume
-                self.texturePlayer.volume = self.textureCurrentVolume
-                if progress >= 1.0 {
-                    self.textureState = .playing
-                    // Decide random play time before fading out
-                    nextActionTime = now.addingTimeInterval(Double.random(in: 12.0...28.0))
+                // Compute current envelopes
+                var stutterWetBoost: Double = 0.0
+                if stutterState == .active {
+                    let t: TimeInterval = now.timeIntervalSince(stutterStart)
+                    let denom: Double = max(0.05, stutterDuration)
+                    let p: Double = max(0.0, min(1.0, t / denom))
+                    // quick up and down (triangle)
+                    if p < 0.5 {
+                        stutterWetBoost = p / 0.5
+                    } else {
+                        let tail: Double = (p - 0.5) / 0.5
+                        stutterWetBoost = max(0.0, 1.0 - tail)
+                    }
+                    if t >= stutterDuration {
+                        stutterState = .cooling
+                        stutterCoolUntil = now.addingTimeInterval(Double.random(in: 12.0...25.0))
+                        stutterWetBoost = 0.0
+                    }
+                } else if stutterState == .cooling {
+                    if now >= stutterCoolUntil { stutterState = .idle }
                 }
 
-            case .playing:
-                if now >= nextActionTime {
-                    self.textureState = .fadingOut
-                    fadeStartTime = now
-                    fadeDuration = Double.random(in: 3.0...7.0)
+                var swellWet: Double = 0.0
+                var swellPreDelay: Double = 0.0
+                if swellState == .active {
+                    let t: TimeInterval = now.timeIntervalSince(swellStart)
+                    let denom: Double = max(0.2, swellDuration)
+                    let p: Double = max(0.0, min(1.0, t / denom))
+                    // ease-in-out for smoother swell
+                    let eased: Double = 0.5 - 0.5 * cos(p * Double.pi)
+                    swellWet = 0.02 * eased // up to +8% wet
+                    swellPreDelay = 0.020 + 0.025 * eased // add ~20-45 ms pre-delay
+                    if t >= swellDuration {
+                        swellState = .cooling
+                        swellCoolUntil = now.addingTimeInterval(Double.random(in: 30.0...60.0))
+                        swellWet = 0.0
+                        swellPreDelay = 0.0
+                    }
+                } else if swellState == .cooling {
+                    if now >= swellCoolUntil { swellState = .idle }
                 }
 
-            case .fadingOut:
-                let t = now.timeIntervalSince(fadeStartTime)
-                let progress = min(1.0, max(0.0, t / max(0.1, fadeDuration)))
-                self.textureCurrentVolume = (1.0 - Float(progress)) * self.textureTargetVolume
-                self.texturePlayer.volume = self.textureCurrentVolume
-                if progress >= 1.0 {
-                    self.texturePlayer.stop()
-                    self.textureState = .cooldown
-                    // Ensure at least 20 seconds of silence
-                    nextActionTime = now.addingTimeInterval(20.0 + Double.random(in: 0...20.0))
+                // Apply values on main actor for thread safety
+                await MainActor.run {
+                    reverb.wetDryMix = finalReverbF
+                    delay.feedback = finalDelayF
+                    if let band = filter.bands.first {
+                        band.frequency = finalCutoffF
+                    }
+                    // Per-node pan via AVAudioMixerNode submixes
+                    atmosphereMixer.pan = finalAtmospherePanF
+                    textureMixer.pan = finalTexturePanF
+
+                    // Noise bed slow modulation (very subtle)
+                    if noiseEnabled, let nband = noiseLowpass.bands.first {
+                        // Very slow LFOs
+                        let volOmega: Double = (2.0 * Double.pi) / 240.0
+                        let cutoffOmega: Double = (2.0 * Double.pi) / 300.0
+                        let volLFO: Double = 0.5 + 0.5 * sin(volOmega * elapsedSeconds)
+                        let cutoffLFO: Double = sin(cutoffOmega * elapsedSeconds + 0.7)
+                        let targetCut: Double = noiseCutoffBase + noiseCutoffRange * cutoffLFO
+                        let clampedCut: Double = max(1000.0, min(20000.0, targetCut))
+                        nband.frequency = Float(clampedCut)
+                        // Set output volume on the EQ node to control noise level
+                        let noiseGainLinear: Double = Double(noiseGain)
+                        let globalGain: Double = (noiseGainLinear * volLFO) * 10.0
+                        noiseLowpass.globalGain = Float(globalGain)
+                    }
+
+                    // Apply micro-stutter: temporarily bump delay wet mix slightly
+                    let baseWet: Float = 12.0
+                    let stutterBoost: Float = 10.0 * Float(stutterWetBoost) // up to +10%
+                    delay.wetDryMix = baseWet + stutterBoost
+
+                    // Apply diffuse reverse swell: modulate reverb wet and pre-delay
+                    // Preserve the evolving wetDryMix by adding a small swell component
+                    let swellWetAdd: Float = Float(swellWet * 100.0) // convert to percent
+                    let newWet: Float = max(0.0, min(100.0, reverb.wetDryMix + swellWetAdd))
+                    reverb.wetDryMix = newWet
+                    // AVAudioUnitReverb doesn't expose a preDelay parameter. Approximate it by nudging
+                    // the existing delay node's delay time around its 1.0s baseline during swells.
+                    delay.delayTime = 1.0 + swellPreDelay
                 }
 
-            case .cooldown:
-                // Wait for cooldown to expire, then return to idle
-                if now >= nextActionTime {
-                    self.textureState = .idle
-                    self.textureCurrentVolume = 0
-                    self.texturePlayer.volume = 0
-                }
+                // Sleep for ~500 ms, but respond to cancellation immediately
+                try? await Task.sleep(nanoseconds: 500_000_000)
+
+                if Task.isCancelled { break }
             }
         }
-        timer.resume()
+    }
+
+    /// Starts the texture playback control loop using Swift Concurrency Task instead of GCD timers.
+    private func startTextureTask() {
+        textureTask?.cancel()
+        textureTask = Task {
+            var nextActionTime = Date()
+            var fadeStartTime = Date()
+            var fadeDuration: TimeInterval = 0
+
+            // Loop runs every ~250 ms
+            while !Task.isCancelled {
+                let now = Date()
+
+                switch textureState {
+                case .idle:
+                    // Randomly decide to start after a random delay (1-10s)
+                    if now >= nextActionTime {
+                        // 10% chance each tick to begin a fade-in sequence
+                        if Double.random(in: 0...1) < 0.1 {
+                            loadTextureFile()
+                            scheduleTextureIfNeeded()
+                            if !texturePlayer.isPlaying { texturePlayer.play() }
+                            textureState = .fadingIn
+                            fadeStartTime = now
+                            fadeDuration = Double.random(in: 1.0...3.0)
+                            nextActionTime = .distantFuture
+                        } else {
+                            nextActionTime = now.addingTimeInterval(Double.random(in: 1...10))
+                        }
+                    }
+
+                case .fadingIn:
+                    let t = now.timeIntervalSince(fadeStartTime)
+                    let progress = min(1.0, max(0.0, t / max(0.1, fadeDuration)))
+                    textureCurrentVolume = Float(progress) * textureTargetVolume
+                    await MainActor.run {
+                        texturePlayer.volume = textureCurrentVolume
+                    }
+                    if progress >= 1.0 {
+                        textureState = .playing
+                        // Decide random play time before fading out
+                        nextActionTime = now.addingTimeInterval(Double.random(in: 12.0...28.0))
+                    }
+
+                case .playing:
+                    if now >= nextActionTime {
+                        textureState = .fadingOut
+                        fadeStartTime = now
+                        fadeDuration = Double.random(in: 3.0...7.0)
+                    }
+
+                case .fadingOut:
+                    let t = now.timeIntervalSince(fadeStartTime)
+                    let progress = min(1.0, max(0.0, t / max(0.1, fadeDuration)))
+                    textureCurrentVolume = (1.0 - Float(progress)) * textureTargetVolume
+                    await MainActor.run {
+                        texturePlayer.volume = textureCurrentVolume
+                    }
+                    if progress >= 1.0 {
+                        await MainActor.run {
+                            texturePlayer.stop()
+                        }
+                        textureState = .cooldown
+                        // Ensure at least 20 seconds of silence
+                        nextActionTime = now.addingTimeInterval(20.0 + Double.random(in: 0...20.0))
+                    }
+
+                case .cooldown:
+                    // Wait for cooldown to expire, then return to idle
+                    if now >= nextActionTime {
+                        textureState = .idle
+                        textureCurrentVolume = 0
+                        await MainActor.run {
+                            texturePlayer.volume = 0
+                        }
+                    }
+                }
+
+                // Sleep for ~250 ms, but respond to cancellation immediately
+                try? await Task.sleep(nanoseconds: 250_000_000)
+
+                if Task.isCancelled { break }
+            }
+        }
     }
 }
 
