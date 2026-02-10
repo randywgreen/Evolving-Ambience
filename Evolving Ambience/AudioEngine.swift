@@ -88,6 +88,22 @@ public final class AmbientAudioEngine: ObservableObject {
             }
         }
     }
+    /// Bass enabled state to control bass on/off during playback
+    private var bassEnabled: Bool = false {
+        didSet {
+            // Bass node is a source node producing audio automatically if attached and engine running.
+            // So to "disable" bass, set bassGain = 0, to mute it.
+            if bassEnabled {
+                // Restore gain
+                bassGain = bassGainBackup
+            } else {
+                // Backup current gain and mute bass
+                bassGainBackup = bassGain
+                bassGain = 0
+            }
+        }
+    }
+    private var bassGainBackup: Double = 0.35
 
     // Generative state
     
@@ -541,6 +557,9 @@ public final class AmbientAudioEngine: ObservableObject {
             return
         }
 
+        // Enable bass before starting playback
+        bassEnabled = true
+
         // Always schedule at least once before the first play
         loadAndScheduleLoop()
         print("AmbientAudioEngine: Scheduled loop and starting playback.")
@@ -556,12 +575,16 @@ public final class AmbientAudioEngine: ObservableObject {
             _ = bass
         }
         isPlaying = true
+        engine.mainMixerNode.outputVolume = 1.0
         startModulationTask()
         startTextureTask()
     }
 
     /// Stops the ambient audio playback and effect modulations.
     public func stop() {
+        // Disable bass before stopping playback
+        bassEnabled = false
+
         if player.isPlaying {
             player.stop()
         }
@@ -578,6 +601,7 @@ public final class AmbientAudioEngine: ObservableObject {
         texturePlayer.volume = 0
 
         isPlaying = false
+        engine.mainMixerNode.outputVolume = 0.0
 
         // Instead of detaching and nil-ing nodes on stop, just let them remain attached for reuse.
         // Noise and bass nodes do not have .stop() method; they run as part of the engine graph.
