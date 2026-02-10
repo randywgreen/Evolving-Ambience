@@ -68,8 +68,33 @@ public final class AmbientAudioEngine: ObservableObject {
     // MARK: - Cached audio files to avoid repeated loading and failure spam
     private var cachedAtmosphereFile: AVAudioFile?
     private var atmosphereFileLoadFailed = false
+    private var fadeTask: Task<Void, Never>?
 
-    /// Initializes the ambient audio engine.
+    /// Ramps the main mixer output volume to a target over a duration.
+    private func rampMixerVolume(to target: Float, duration: TimeInterval) {
+        fadeTask?.cancel()
+        let startVolume = engine.mainMixerNode.outputVolume
+        let clampedTarget = max(0, min(target, 1))
+        guard duration > 0 else {
+            engine.mainMixerNode.outputVolume = clampedTarget
+            return
+        }
+        fadeTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let steps = 60
+            let stepDuration = duration / Double(steps)
+            for i in 1...steps {
+                if Task.isCancelled { return }
+                let t = Float(i) / Float(steps)
+                let eased = t * t * (3 - 2 * t) // smoothstep easing
+                let newVol = startVolume + (clampedTarget - startVolume) * eased
+                self.engine.mainMixerNode.outputVolume = newVol
+                try? await Task.sleep(nanoseconds: UInt64(stepDuration * 1_000_000_000))
+            }
+            self.engine.mainMixerNode.outputVolume = clampedTarget
+        }
+    }
+
     public init() {
         self.engine = AVAudioEngine()
         self.player = AVAudioPlayerNode()
@@ -242,14 +267,16 @@ public final class AmbientAudioEngine: ObservableObject {
         loadAndScheduleLoop()
         print("AmbientAudioEngine: Scheduled loop and starting playback.")
 
+        engine.mainMixerNode.outputVolume = 0.0
         player.play()
+        rampMixerVolume(to: volume, duration: 2.5)
         isPlaying = true
-        engine.mainMixerNode.outputVolume = 1.0
     }
 
     /// Stops the ambient audio playback and effect modulations.
     public func stop() {
         // Disable bass before stopping playback
+        fadeTask?.cancel()
         bassEnabled = false
 
         if player.isPlaying {
