@@ -37,19 +37,12 @@ struct ContentView: View {
                 .accessibilityLabel("Stop ambient audio")
             }
 
-            Slider(value: $engine.volume, in: 0...1) { isEditing in
-                if !isEditing {
-                    engine.setVolume(engine.volume)
-                }
-            }
-            .accentColor(.blue)
-            .padding(.horizontal)
-            .accessibilityLabel("Volume")
+            Slider(value: $engine.volume, in: 0...1)
+                .accentColor(.blue)
+                .padding(.horizontal)
+                .accessibilityLabel("Volume")
         }
         .padding()
-        .onAppear {
-            engine.setVolume(engine.volume)
-        }
     }
 }
 
