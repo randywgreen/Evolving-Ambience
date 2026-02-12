@@ -14,6 +14,12 @@ public final class AmbientAudioEngine: ObservableObject {
     private let eq = AVAudioUnitEQ(numberOfBands: 1)
     private let delay = AVAudioUnitDelay()
 
+    private let chorusLeftDelay = AVAudioUnitDelay()
+    private let chorusRightDelay = AVAudioUnitDelay()
+    private let chorusLeftPan = AVAudioMixerNode()
+    private let chorusRightPan = AVAudioMixerNode()
+    private let chorusSumMixer = AVAudioMixerNode()
+
     /// Reverb wet/dry mix in percent (0..100). Adjusts the reverb unit immediately when set.
     public var reverbWetDryMix: Float = 30 {
         didSet {
@@ -39,6 +45,37 @@ public final class AmbientAudioEngine: ObservableObject {
     public var delayWetDryMix: Float = 15 { // percent 0..100
         didSet { delay.wetDryMix = max(0, min(delayWetDryMix, 100)) }
     }
+
+    /// Chorus parameters (implemented via short delay with LFO modulation)
+    public var chorusBaseTime: Double = 0.02 { // seconds, ~20ms
+        didSet {
+            let clamped = max(0.0, min(chorusBaseTime, 0.05))
+            chorusLeftDelay.delayTime = clamped
+            chorusRightDelay.delayTime = clamped
+        }
+    }
+    public var chorusDepth: Double = 0.005 { // seconds, modulation depth ~5ms
+        didSet { /* applied by LFO */ }
+    }
+    public var chorusRateHz: Double = 0.25 { // Hz, slow movement
+        didSet { /* applied by LFO */ }
+    }
+    public var chorusFeedback: Float = 5 { // percent 0..100
+        didSet {
+            let v = max(0, min(chorusFeedback, 100))
+            chorusLeftDelay.feedback = v
+            chorusRightDelay.feedback = v
+        }
+    }
+    public var chorusWetDryMix: Float = 12 { // percent 0..100
+        didSet {
+            let v = max(0, min(chorusWetDryMix, 100))
+            chorusLeftDelay.wetDryMix = v
+            chorusRightDelay.wetDryMix = v
+        }
+    }
+
+    private var chorusLfoTask: Task<Void, Never>?
 
     /// Low-pass sweep controls
     public var lpMinCutoff: Float = 4000 // Hz
@@ -133,6 +170,7 @@ public final class AmbientAudioEngine: ObservableObject {
     public init() {
         self.engine = AVAudioEngine()
         self.player = AVAudioPlayerNode()
+        reverbPreset = .plate
         reverb.loadFactoryPreset(reverbPreset)
         reverb.wetDryMix = reverbWetDryMix
 
@@ -149,6 +187,16 @@ public final class AmbientAudioEngine: ObservableObject {
         delay.feedback = delayFeedback
         delay.lowPassCutoff = delayLowPassCutoff
         delay.wetDryMix = delayWetDryMix
+
+        // Configure true stereo chorus (two short delays with pan)
+        for d in [chorusLeftDelay, chorusRightDelay] {
+            d.delayTime = chorusBaseTime
+            d.feedback = chorusFeedback
+            d.lowPassCutoff = 18000
+            d.wetDryMix = chorusWetDryMix
+        }
+        chorusLeftPan.pan = -1.0
+        chorusRightPan.pan = 1.0
 
         self.volume = 0.25
         self.isPlaying = false
@@ -251,12 +299,29 @@ public final class AmbientAudioEngine: ObservableObject {
         engine.attach(reverb)
         engine.attach(eq)
         engine.attach(delay)
+        engine.attach(chorusLeftDelay)
+        engine.attach(chorusRightDelay)
+        engine.attach(chorusLeftPan)
+        engine.attach(chorusRightPan)
+        engine.attach(chorusSumMixer)
         if let bass = bassNode { engine.attach(bass) }
         let mainMixer = engine.mainMixerNode
+
         engine.connect(player, to: eq, format: nil)
-        engine.connect(eq, to: delay, format: nil)
+        // Split EQ output to left/right chorus paths
+        engine.connect(eq, to: chorusLeftDelay, format: nil)
+        engine.connect(eq, to: chorusRightDelay, format: nil)
+        // Pan each chorus branch to opposite sides
+        engine.connect(chorusLeftDelay, to: chorusLeftPan, format: nil)
+        engine.connect(chorusRightDelay, to: chorusRightPan, format: nil)
+        // Sum both branches
+        engine.connect(chorusLeftPan, to: chorusSumMixer, format: nil)
+        engine.connect(chorusRightPan, to: chorusSumMixer, format: nil)
+        // Continue chain
+        engine.connect(chorusSumMixer, to: delay, format: nil)
         engine.connect(delay, to: reverb, format: nil)
         engine.connect(reverb, to: mainMixer, format: nil)
+
         if let bass = bassNode { engine.connect(bass, to: mainMixer, format: nil) }
         mainMixer.outputVolume = volume
     }
@@ -343,6 +408,22 @@ public final class AmbientAudioEngine: ObservableObject {
             }
         }
 
+        chorusLfoTask?.cancel()
+        chorusLfoTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            var t: Double = 0
+            while self.isPlaying && !Task.isCancelled {
+                t += 0.02
+                let lfoLeft = sin(t * (2 * .pi * chorusRateHz)) // -1..1
+                let lfoRight = sin((t * (2 * .pi * chorusRateHz)) + .pi) // 180° offset
+                let modLeft = chorusBaseTime + chorusDepth * (lfoLeft)
+                let modRight = chorusBaseTime + chorusDepth * (lfoRight)
+                chorusLeftDelay.delayTime = max(0.0, min(modLeft, 0.05))
+                chorusRightDelay.delayTime = max(0.0, min(modRight, 0.05))
+                try? await Task.sleep(nanoseconds: 20_000_000) // 20ms for smooth modulation
+            }
+        }
+
         rampMixerVolume(to: volume, duration: 2.5)
         isPlaying = true
     }
@@ -353,6 +434,8 @@ public final class AmbientAudioEngine: ObservableObject {
         fadeTask?.cancel()
         lpSweepTask?.cancel()
         lpSweepTask = nil
+        chorusLfoTask?.cancel()
+        chorusLfoTask = nil
         bassEnabled = false
 
         if player.isPlaying {
@@ -390,6 +473,11 @@ public final class AmbientAudioEngine: ObservableObject {
         engine.detach(reverb)
         engine.detach(eq)
         engine.detach(delay)
+        engine.detach(chorusLeftDelay)
+        engine.detach(chorusRightDelay)
+        engine.detach(chorusLeftPan)
+        engine.detach(chorusRightPan)
+        engine.detach(chorusSumMixer)
 
         engine.stop()
     }
