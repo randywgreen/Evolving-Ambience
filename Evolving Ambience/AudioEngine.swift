@@ -11,6 +11,9 @@ public final class AmbientAudioEngine: ObservableObject {
     private let engine: AVAudioEngine
     private let player: AVAudioPlayerNode
     private let reverb = AVAudioUnitReverb()
+    private let eq = AVAudioUnitEQ(numberOfBands: 1)
+    private let delay = AVAudioUnitDelay()
+
     /// Reverb wet/dry mix in percent (0..100). Adjusts the reverb unit immediately when set.
     public var reverbWetDryMix: Float = 30 {
         didSet {
@@ -22,6 +25,26 @@ public final class AmbientAudioEngine: ObservableObject {
     public var reverbPreset: AVAudioUnitReverbPreset = .largeHall {
         didSet { reverb.loadFactoryPreset(reverbPreset) }
     }
+
+    /// Delay parameters for the atmosphere loop
+    public var delayTime: Double = 0.45 { // seconds
+        didSet { delay.delayTime = max(0.0, min(delayTime, 2.0)) }
+    }
+    public var delayFeedback: Float = 18 { // percent 0..100
+        didSet { delay.feedback = max(0, min(delayFeedback, 100)) }
+    }
+    public var delayLowPassCutoff: Float = 6000 { // Hz
+        didSet { delay.lowPassCutoff = max(10, min(delayLowPassCutoff, 20000)) }
+    }
+    public var delayWetDryMix: Float = 15 { // percent 0..100
+        didSet { delay.wetDryMix = max(0, min(delayWetDryMix, 100)) }
+    }
+
+    /// Low-pass sweep controls
+    public var lpMinCutoff: Float = 4000 // Hz
+    public var lpMaxCutoff: Float = 10000 // Hz
+    public var lpSweepEnabled: Bool = true
+    private var lpSweepTask: Task<Void, Never>?
 
     // Synth bass pulse
     private var bassNode: AVAudioSourceNode?
@@ -112,6 +135,21 @@ public final class AmbientAudioEngine: ObservableObject {
         self.player = AVAudioPlayerNode()
         reverb.loadFactoryPreset(reverbPreset)
         reverb.wetDryMix = reverbWetDryMix
+
+        // Configure EQ low-pass band
+        if let band = eq.bands.first {
+            band.filterType = .lowPass
+            band.frequency = (lpMinCutoff + lpMaxCutoff) / 2
+            band.bypass = false
+            band.bandwidth = 0.5
+            band.gain = 0
+        }
+        // Configure delay
+        delay.delayTime = delayTime
+        delay.feedback = delayFeedback
+        delay.lowPassCutoff = delayLowPassCutoff
+        delay.wetDryMix = delayWetDryMix
+
         self.volume = 0.25
         self.isPlaying = false
 
@@ -211,9 +249,13 @@ public final class AmbientAudioEngine: ObservableObject {
     private func attachAndConnectNodes() {
         engine.attach(player)
         engine.attach(reverb)
+        engine.attach(eq)
+        engine.attach(delay)
         if let bass = bassNode { engine.attach(bass) }
         let mainMixer = engine.mainMixerNode
-        engine.connect(player, to: reverb, format: nil)
+        engine.connect(player, to: eq, format: nil)
+        engine.connect(eq, to: delay, format: nil)
+        engine.connect(delay, to: reverb, format: nil)
         engine.connect(reverb, to: mainMixer, format: nil)
         if let bass = bassNode { engine.connect(bass, to: mainMixer, format: nil) }
         mainMixer.outputVolume = volume
@@ -285,6 +327,22 @@ public final class AmbientAudioEngine: ObservableObject {
 
         engine.mainMixerNode.outputVolume = 0.0
         player.play()
+
+        lpSweepTask?.cancel()
+        if lpSweepEnabled, let band = eq.bands.first {
+            lpSweepTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                var t: Double = 0
+                while self.isPlaying && !Task.isCancelled {
+                    t += 0.02
+                    let normalized = Float((sin(t * 0.05) + 1) / 2) // 0..1
+                    let cutoff = lpMinCutoff + (lpMaxCutoff - lpMinCutoff) * normalized
+                    band.frequency = cutoff
+                    try? await Task.sleep(nanoseconds: 200_000_000) // 0.2s
+                }
+            }
+        }
+
         rampMixerVolume(to: volume, duration: 2.5)
         isPlaying = true
     }
@@ -293,6 +351,8 @@ public final class AmbientAudioEngine: ObservableObject {
     public func stop() {
         // Disable bass before stopping playback
         fadeTask?.cancel()
+        lpSweepTask?.cancel()
+        lpSweepTask = nil
         bassEnabled = false
 
         if player.isPlaying {
@@ -328,6 +388,8 @@ public final class AmbientAudioEngine: ObservableObject {
         }
 
         engine.detach(reverb)
+        engine.detach(eq)
+        engine.detach(delay)
 
         engine.stop()
     }
