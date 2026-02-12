@@ -98,7 +98,7 @@ public final class AmbientAudioEngine: ObservableObject {
     public init() {
         self.engine = AVAudioEngine()
         self.player = AVAudioPlayerNode()
-        self.volume = 0.5
+        self.volume = 0.25
         self.isPlaying = false
 
         // Platform-dependent audio session configuration:
