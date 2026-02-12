@@ -10,6 +10,18 @@ import Combine
 public final class AmbientAudioEngine: ObservableObject {
     private let engine: AVAudioEngine
     private let player: AVAudioPlayerNode
+    private let reverb = AVAudioUnitReverb()
+    /// Reverb wet/dry mix in percent (0..100). Adjusts the reverb unit immediately when set.
+    public var reverbWetDryMix: Float = 30 {
+        didSet {
+            let clamped = max(0, min(reverbWetDryMix, 100))
+            if clamped != reverb.wetDryMix { reverb.wetDryMix = clamped }
+        }
+    }
+    /// Reverb preset used for the atmosphere loop.
+    public var reverbPreset: AVAudioUnitReverbPreset = .largeHall {
+        didSet { reverb.loadFactoryPreset(reverbPreset) }
+    }
 
     // Synth bass pulse
     private var bassNode: AVAudioSourceNode?
@@ -98,6 +110,8 @@ public final class AmbientAudioEngine: ObservableObject {
     public init() {
         self.engine = AVAudioEngine()
         self.player = AVAudioPlayerNode()
+        reverb.loadFactoryPreset(reverbPreset)
+        reverb.wetDryMix = reverbWetDryMix
         self.volume = 0.25
         self.isPlaying = false
 
@@ -196,9 +210,11 @@ public final class AmbientAudioEngine: ObservableObject {
 
     private func attachAndConnectNodes() {
         engine.attach(player)
+        engine.attach(reverb)
         if let bass = bassNode { engine.attach(bass) }
         let mainMixer = engine.mainMixerNode
-        engine.connect(player, to: mainMixer, format: nil)
+        engine.connect(player, to: reverb, format: nil)
+        engine.connect(reverb, to: mainMixer, format: nil)
         if let bass = bassNode { engine.connect(bass, to: mainMixer, format: nil) }
         mainMixer.outputVolume = volume
     }
@@ -310,6 +326,8 @@ public final class AmbientAudioEngine: ObservableObject {
             engine.detach(bass)
             bassNode = nil
         }
+
+        engine.detach(reverb)
 
         engine.stop()
     }
